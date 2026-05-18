@@ -1,0 +1,32 @@
+# AI Trading Bot - Dependencies
+# Installiere mit: pip install -r requirements.txt
+
+# Marktdaten
+yfinance>=0.2.36
+
+# KI-Analyse
+openai>=1.30.0
+
+# Broker Integration (Alpaca)
+alpaca-trade-api>=3.0.0
+
+# Datenverarbeitung
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# HTTP Requests (für NewsAPI)
+requests>=2.31.0
+
+# Timezone
+pytz>=2023.3
+
+# Scheduler
+schedule>=1.2.0
+
+# Dashboard (optional)
+streamlit>=1.35.0
+plotly>=5.20.0
+
+# Development (optional)
+python-dotenv>=1.0.0
