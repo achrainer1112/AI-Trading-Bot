@@ -1,7 +1,10 @@
 """
 AI Trading Bot - Konfigurationsdatei
 =====================================
-Alle zentralen Einstellungen für den Trading Bot.
+PHASE 4A: Live Trading Migration
+  - TRADING_MODE → LIVE
+  - ALLOW_LIVE_TRADING als harter Gate (muss explizit True gesetzt werden)
+  - Kein Fallback auf PAPER wenn LIVE nicht erlaubt → SYSTEM STOP
 """
 
 import os
@@ -12,9 +15,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────────
-# TRADING MODUS
+# TRADING MODUS – PHASE 4A: LIVE
 # ─────────────────────────────────────────────
-TRADING_MODE = os.getenv("TRADING_MODE", "PAPER")  # "PAPER" oder "REAL"
+TRADING_MODE = os.getenv("TRADING_MODE", "LIVE")   # ← PAPER → LIVE
+
+# ─────────────────────────────────────────────
+# LIVE TRADING GATE  ← NEU (Phase 4A)
+# ─────────────────────────────────────────────
+# MUSS in .env auf true gesetzt werden:
+#   ALLOW_LIVE_TRADING=true
+#
+# Wenn False UND TRADING_MODE=LIVE:
+#   → SYSTEM STOP – kein Fallback, kein Paper
+#
+ALLOW_LIVE_TRADING: bool = os.getenv("ALLOW_LIVE_TRADING", "false").strip().lower() == "true"
+
+# ─────────────────────────────────────────────
+# DRAWDOWN KILL-SWITCH  ← NEU (Phase 4A)
+# ─────────────────────────────────────────────
+# Bei Portfolio-Drawdown >= KILL_SWITCH_DRAWDOWN_PCT:
+#   → cancel_all_orders() + flatten_all_positions() + disable trading
+KILL_SWITCH_DRAWDOWN_PCT: float = float(os.getenv("KILL_SWITCH_DRAWDOWN_PCT", "0.08"))  # default -8%
 
 # ─────────────────────────────────────────────
 # API KEYS
@@ -24,7 +45,10 @@ OPENAI_MODEL = "gpt-4o-mini"
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+# Phase 4A: LIVE → echte Alpaca-URL verwenden
+# Für LIVE muss ALPACA_BASE_URL in der .env auf https://api.alpaca.markets gesetzt werden
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 

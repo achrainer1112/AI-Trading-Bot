@@ -53,6 +53,8 @@ from trading_journal import journal
 from market_regime import Regime
 from market_regime_enhanced import EnhancedMarketRegimeDetector
 from decision_filter import apply_decision_filter
+from execution_safety import LiveRunLogger, DrawdownMonitor
+from config import ALLOW_LIVE_TRADING, KILL_SWITCH_DRAWDOWN_PCT
 
 
 import os
@@ -79,9 +81,16 @@ class TradingBot:
 
         # Executor zuerst – Alpaca-Verbindung wird für Portfolio-Sync benötigt
         self.executor     = TradeExecutor(mode=self.mode)
-        alpaca_api        = self.executor.api if self.mode in ("PAPER", "REAL") else None
+        alpaca_api        = self.executor.api if self.mode in ("PAPER", "REAL", "LIVE") else None
         self.portfolio    = PortfolioManager(mode=self.mode, alpaca_api=alpaca_api)
         self.risk_manager = RiskManager(ACTIVE_RISK_PROFILE)
+
+        # ── Phase 4A: Live Safety Layer ──────────────────────────────────────
+        self._live_logger = LiveRunLogger()
+        _guard = self.executor.get_guard()
+        self._drawdown_monitor = DrawdownMonitor(
+            guard=_guard, limit_pct=KILL_SWITCH_DRAWDOWN_PCT
+        ) if _guard else None
 
     # ─── Hauptablauf ──────────────────────────────────────────────────────────
 
@@ -346,9 +355,35 @@ class TradingBot:
 
         execution_enabled = (
             not analysis_only
-            and self.mode in ("PAPER", "REAL")
+            and self.mode in ("PAPER", "REAL", "LIVE")
             and self.executor.api is not None
         )
+
+        # ── Phase 4A: Guard-Validierungen (Marktdaten + KI-Response) ─────────
+        _guard = self.executor.get_guard()
+        if execution_enabled and _guard:
+            md_ok  = _guard.validate_market_data(market_data)
+            ai_ok  = _guard.validate_ai_response(ai_result)
+            if not md_ok or not ai_ok:
+                log.critical(
+                    f"[PHASE 4A] Guard-Validierung fehlgeschlagen: "                    f"market_data={md_ok} ai_response={ai_ok} → Execution deaktiviert."
+                )
+                execution_enabled = False
+                run_summary["errors"].append("guard_validation_failed")
+
+        # ── Phase 4A: Drawdown Kill-Switch prüfen ─────────────────────────────
+        if execution_enabled and self._drawdown_monitor:
+            _total = portfolio_summary_before.get("total_value", 0)
+            _peak  = portfolio_summary_before.get("peak_value") or _total
+            killed = self._drawdown_monitor.check(
+                portfolio_value=_total,
+                peak_value=_peak,
+                api=self.executor.api,
+            )
+            if killed:
+                log.critical("[PHASE 4A] Drawdown Kill-Switch ausgelöst → Execution gestoppt.")
+                execution_enabled = False
+                run_summary["errors"].append("drawdown_kill_switch")
 
         if not execution_enabled:
             log.info("\nSCHRITT 7/8: Execution disabled – nur Simulation")
@@ -399,7 +434,7 @@ class TradingBot:
             log.info("\n  ── Phase 1: SELL-Phase übersprungen (Execution disabled oder keine SELLs) ──")
             run_summary["sells_executed"] = 0
 
-        if execution_enabled and sell_trades and self.mode in ("PAPER", "REAL") and self.executor.api:
+        if execution_enabled and sell_trades and self.mode in ("PAPER", "REAL", "LIVE") and self.executor.api:
             log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
             time.sleep(2)
             self.portfolio._load_from_alpaca()
@@ -473,6 +508,16 @@ class TradingBot:
         if executed_records:
             cooldown_manager.register_executed_trades(executed_records)
 
+        # ── Phase 4A: Rejected/Aborted Trades sammeln ─────────────────────────
+        rejected_records = [
+            r for r in executed_records
+            if r.get("status") in ("REJECTED", "ABORTED", "SKIPPED")
+        ]
+        real_executed_records = [
+            r for r in executed_records
+            if r.get("status") == "EXECUTED"
+        ]
+
         if not execution_enabled and analysis_only:
             log.info(f"Executed trades: 0 (market closed)")
         elif not execution_enabled:
@@ -528,6 +573,23 @@ class TradingBot:
             market_closed=run_summary.get("market_closed", False),
             debug=False,
         )
+
+        # ── Phase 4A: Live-Pflichtprotokoll /logs/live/YYYY-MM-DD.json ──────────
+        if self.mode == "LIVE":
+            _guard = self.executor.get_guard()
+            self._live_logger.log_run(
+                guard_snapshot=_guard.status_snapshot() if _guard else {},
+                executed_trades=real_executed_records,
+                rejected_trades=rejected_records,
+                portfolio_snapshot=portfolio_summary_after,
+                risk_state={
+                    "profile":   ACTIVE_RISK_PROFILE.value,
+                    "warnings":  warnings,
+                    "var_ok":    var_ok,
+                },
+                regime_state=regime_state.to_dict() if regime_state else None,
+                run_summary=run_summary,
+            )
 
         # Run-Summary
         duration = (datetime.now() - start_time).seconds
@@ -663,7 +725,7 @@ class TradingBot:
         Fix #10: Nach jedem Run sicherstellen dass Portfolio == Broker-State.
         Bei Abweichungen wird gewarnt und ggf. re-synct.
         """
-        if self.mode not in ("PAPER", "REAL") or not self.executor.api:
+        if self.mode not in ("PAPER", "REAL", "LIVE") or not self.executor.api:
             return  # DRY Modus: kein Broker-Abgleich möglich
 
         try:
