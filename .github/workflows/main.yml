@@ -10,8 +10,8 @@ name: 🤖 AI Trading Bot – Daily Live Run
 
 on:
   schedule:
-    # 18:00 UTC = 20:00 CET = 12:00 ET (post-close buffer)
-    - cron: "0 18 * * 1-5"
+    # 17:00 UTC = 19:00 CET (mit Github Verzögerung erst so um 20:30)
+    - cron: "0 17 * * 1-5"
 
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
