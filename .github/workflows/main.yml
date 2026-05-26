@@ -2,8 +2,8 @@
 # AI Trading Bot – GitHub Actions Workflow
 # PHASE 4B: Full Automation via GitHub Actions
 # ============================================================
-# Schedule: Mon–Fri, 18:00 UTC (20:00 CET / 12:00 PM ET)
-# This gives ~2h buffer after US market close (16:00 ET)
+# Schedule: Mon–Fri, 17:00 UTC / 19:00 CET 
+# Mit Github Verzögerungen Start erst um ca. 20:30
 # ============================================================
 
 name: 🤖 AI Trading Bot – Daily Live Run
