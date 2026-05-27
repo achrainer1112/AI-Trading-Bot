@@ -19,6 +19,8 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    outputs:
+      safe_to_trade: ${{ steps.set_gate.outputs.safe_to_trade }}
 
     steps:
       - uses: actions/checkout@v4
@@ -118,6 +120,23 @@ jobs:
           name: gate
           path: runtime/gate.json
 
+      # -------------------------
+      # EXPORT JOB OUTPUT (for needs.*.outputs.safe_to_trade)
+      # -------------------------
+      - name: Set job output
+        id: set_gate
+        run: |
+          safe=false
+          if [ -f runtime/gate.json ]; then
+            safe=$(python - <<'PY'
+import json
+data=json.load(open('runtime/gate.json'))
+print('true' if data.get('safe_to_trade') else 'false')
+PY
+)
+          fi
+          echo "safe_to_trade=${safe}" >> $GITHUB_OUTPUT
+
 
 # ============================================================
 # 2) TRADING JOB
@@ -125,7 +144,7 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     needs: preflight
-    if: success()
+    if: success() && needs.preflight.outputs.safe_to_trade == 'true'
 
     timeout-minutes: 30
 
@@ -152,6 +171,10 @@ jobs:
         with:
           name: gate
           path: runtime
+
+      - name: Debug gate output
+        run: |
+          echo "preflight.safe_to_trade=${{ needs.preflight.outputs.safe_to_trade }}"
 
       - name: Verify gate
         run: |
