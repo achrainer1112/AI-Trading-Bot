@@ -555,22 +555,23 @@ class PortfolioManager:
 
         FIX 3 – SOFT REBALANCING:
           Nur handeln wenn Allokations-Drift > DRIFT_THRESHOLD (2%).
-          Vollstaendige Liquidation (target=0) nur bei explizitem Signal:
-          orphan=True, stop_loss=True oder confidence >= 0.80.
+          Vollstaendige Liquidation (target=0) nur bei explizitem Signal.
 
         FIX 2 – PRE-TRADE VALIDATION:
           qty_available (Broker-exakt) fuer SELL-Stueckzahlen.
-          6 Dezimalstellen gegen Floating-Point-Fehler.
-
-        target_allocations: {ticker: gewuenschter_anteil_0_bis_1}
-        current_prices: {ticker: aktueller_preis}
-        decisions_map: {ticker: ki_entscheidung_dict}
-        Gibt Liste von Trade-Dicts zurueck (SELLs zuerst).
         """
         decisions_map = decisions_map or {}
         total_value = self.get_total_value()
         current_allocs = self.get_allocations()
         trades = []
+
+        # Dynamische Mindestordergröße für kleine Konten
+        from config import RISK_SETTINGS, ACTIVE_RISK_PROFILE
+        _profile_settings = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
+        min_trade_value = _profile_settings.get("min_trade_value", 100.0)
+        if total_value < 10000:
+            min_trade_value = max(10.0, total_value * 0.05)
+            log.info(f"Small account: adjusted min_trade_value to ${min_trade_value:.2f}")
 
         for ticker, target_alloc in target_allocations.items():
             if ticker == "CASH":
@@ -605,13 +606,8 @@ class PortfolioManager:
                     })
                     continue
 
-                # FIX: KI sagt SELL mit Konfidenz ≥ 60% und Position vorhanden
-                # → als force_close weitergeben, auch ohne aktuellen Preis
-                if (
-                    in_portfolio_check
-                    and ai_action_check == "SELL"
-                    and ai_conf_check >= 0.60
-                ):
+                # KI sagt SELL mit Konfidenz ≥ 60% und Position vorhanden
+                if (in_portfolio_check and ai_action_check == "SELL" and ai_conf_check >= 0.60):
                     pos_qty = self.positions[ticker].get("qty_available",
                               self.positions[ticker].get("quantity", 0))
                     avg_px  = self.positions[ticker].get("avg_price", 0)
@@ -619,7 +615,6 @@ class PortfolioManager:
                         f"SELL {ticker}: kein aktueller Marktpreis → "
                         f"nutze Ø-Kaufpreis ${avg_px:.2f} als Fallback-Preis."
                     )
-                    # Fallback: avg_price als Schätzpreis verwenden
                     est_value = pos_qty * avg_px
                     trades.append({
                         "ticker": ticker,
@@ -633,7 +628,7 @@ class PortfolioManager:
                         "ai_action": "SELL",
                         "ai_reason": decisions_map.get(ticker, {}).get("reason", "Portfolio Rebalancing"),
                         "ai_confidence": ai_conf_check,
-                        "price_estimated": True,  # Flag: Preis ist Schätzung
+                        "price_estimated": True,
                     })
                     continue
 
@@ -657,7 +652,6 @@ class PortfolioManager:
                 continue
 
             # FIX 3: Vollstaendige Liquidation NUR bei explizitem Signal
-            # Verhindert aggressiven Hard Reset durch KI-Allokation=0
             is_explicit_liquidation = (
                 target_alloc == 0.0
                 and in_portfolio
@@ -704,7 +698,7 @@ class PortfolioManager:
             # FIX 3: Soft Rebalancing – nur bei BUYs anwenden
             alloc_drift = abs(current_alloc - target_alloc)
             if ai_action == "BUY" and target_alloc > 0:
-                effective_threshold = 0.01  # 1% Threshold für gewollte Aufstockungen
+                effective_threshold = 0.01
                 if alloc_drift < effective_threshold:
                     log.debug(
                         f"{ticker}: BUY-Drift {alloc_drift:.1%} < {effective_threshold:.0%} Schwelle "
@@ -712,14 +706,24 @@ class PortfolioManager:
                     )
                     continue
 
+            # --- ÄNDERUNG HIER: Kleine Differenzen auf Mindestwert aufrunden ---
             if abs(diff_value) < min_trade_value:
-                log.debug(f"{ticker}: Differenz ${diff_value:.2f} unter Mindestwert, ueberspringe.")
-                continue
+                # Wenn BUY und genehmigt, trotzdem auf Mindestwert aufrunden
+                if ai_action == "BUY" and decision.get("risk_approved", False) and diff_value > 0:
+                    log.info(
+                        f"{ticker}: BUY-Differenz ${diff_value:.2f} unter Mindestwert ${min_trade_value:.2f} "
+                        f"→ aufrunden auf ${min_trade_value:.2f}"
+                    )
+                    diff_value = min_trade_value
+                    target_value = current_value + diff_value
+                    target_alloc = target_value / total_value
+                else:
+                    log.debug(f"{ticker}: Differenz ${diff_value:.2f} unter Mindestwert, überspringe.")
+                    continue
 
             action = "BUY" if diff_value > 0 else "SELL"
 
             if action == "SELL":
-                # FIX 2: Broker-exakte Stueckzahl fuer Teilverkauf
                 available_qty = self.positions.get(ticker, {}).get(
                     "qty_available", self.positions.get(ticker, {}).get("quantity", 0)
                 )
@@ -754,7 +758,6 @@ class PortfolioManager:
                 f"Drift: {alloc_drift:.1%})"
             )
 
-        # SELLs zuerst (Cash generieren fuer BUYs)
         trades.sort(key=lambda t: 0 if t["action"] == "SELL" else 1)
         return trades
 
