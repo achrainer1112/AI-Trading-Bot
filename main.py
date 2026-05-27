@@ -894,7 +894,7 @@ def run_scheduler(bot: TradingBot):
 
 def main():
     parser = argparse.ArgumentParser(description="AI Trading Bot")
-    parser.add_argument("--mode",     choices=["dry", "paper", "real"], default=TRADING_MODE.lower())
+    parser.add_argument("--mode",     choices=["dry", "paper", "real", "live"], default=TRADING_MODE.lower())
     parser.add_argument("--backtest", action="store_true",
                         help="Momentum-Backtest (Baseline, kostenlos)")
     parser.add_argument("--ai",       action="store_true",
