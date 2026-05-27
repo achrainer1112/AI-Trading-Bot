@@ -2,13 +2,8 @@ name: 🤖 AI Trading Bot – Daily Live Run
 
 on:
   schedule:
-    - cron: "0 17 * * 1-5"   # 17:00 UTC (CET offset)
+    - cron: "0 17 * * 1-5"
   workflow_dispatch:
-    inputs:
-      mode:
-        default: live
-        type: choice
-        options: [live, paper]
 
 permissions:
   contents: read
@@ -20,10 +15,17 @@ concurrency:
 
 
 # ============================================================
-# 🔍 PREFLIGHT JOB
+# GLOBAL ENV (fix Node warning optional)
 # ============================================================
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+
 jobs:
 
+# ============================================================
+# 🔍 PREFLIGHT
+# ============================================================
   preflight:
     runs-on: ubuntu-latest
 
@@ -34,16 +36,19 @@ jobs:
     steps:
 
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       # --------------------------------------------------------
       # 🔐 SECRET CHECK
       # --------------------------------------------------------
-      - name: Validate Secrets
+      - name: Secret Check
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
         run: |
           python - <<'EOF'
           import os, sys
@@ -58,16 +63,11 @@ jobs:
           missing = [k for k in required if not os.getenv(k)]
 
           if missing:
-              print("❌ Missing secrets:", missing)
+              print("❌ Missing:", missing)
               sys.exit(1)
 
           print("✅ Secrets OK")
           EOF
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
 
       # --------------------------------------------------------
       # 📊 MARKET STATUS
@@ -78,41 +78,44 @@ jobs:
           echo "status=OPEN" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------
-      # 🧠 SAFETY GATE (FIXED - NO PYTHON, NO FAILURES)
+      # 🧠 SAFETY GATE (FIXED + NON-SECRET OUTPUT SAFE)
       # --------------------------------------------------------
       - name: Safety Gate
         id: gate
         env:
           ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
         run: |
-          echo "DEBUG: ALLOW_LIVE_TRADING=$ALLOW_LIVE_TRADING"
+          set -e
+
+          echo "ALLOW_LIVE_TRADING=$ALLOW_LIVE_TRADING"
 
           if [[ "$ALLOW_LIVE_TRADING" != "true" ]]; then
-            echo "safe_to_trade=false" >> $GITHUB_OUTPUT
+            echo "safe_to_trade=false" >> "$GITHUB_OUTPUT"
             echo "❌ LIVE TRADING DISABLED"
             exit 0
           fi
 
-          echo "safe_to_trade=true" >> $GITHUB_OUTPUT
+          printf "safe_to_trade=true\n" >> "$GITHUB_OUTPUT"
           echo "✅ SAFE TO TRADE"
 
       # --------------------------------------------------------
-      # 🧪 DEBUG OUTPUT CHECK (IMPORTANT)
+      # 🧪 DEBUG OUTPUTS (IMPORTANT)
       # --------------------------------------------------------
       - name: Debug Outputs
         run: |
           echo "market=${{ steps.market.outputs.status }}"
           echo "gate=${{ steps.gate.outputs.safe_to_trade }}"
+          cat $GITHUB_OUTPUT || true
 
 
 # ============================================================
-# 📈 TRADING JOB
+# 📈 TRADING
 # ============================================================
   trade:
     runs-on: ubuntu-latest
     needs: preflight
 
-    # 🔥 NULL-SAFE CONDITION (important fix)
+    # 🔥 NULL-SAFE CONDITION (THIS FIXES YOUR BUG)
     if: ${{ needs.preflight.outputs.safe_to_trade == 'true' }}
 
     timeout-minutes: 30
@@ -120,16 +123,14 @@ jobs:
     steps:
 
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Create Folders
+      - name: Create folders
         run: mkdir -p logs decisions
 
       # --------------------------------------------------------
@@ -143,11 +144,11 @@ jobs:
           ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
           TRADING_MODE: live
         run: |
-          echo "🚀 START TRADING RUN"
+          echo "🚀 START TRADING"
           python main.py --mode live 2>&1 | tee logs/run.log
 
       # --------------------------------------------------------
-      # 📦 LOGS
+      # 📦 LOGGING
       # --------------------------------------------------------
       - name: Upload Logs
         if: always()
@@ -165,7 +166,7 @@ jobs:
 
 
 # ============================================================
-# 📋 AUDIT SKIP JOB
+# 📋 AUDIT SKIP
 # ============================================================
   audit:
     runs-on: ubuntu-latest
@@ -174,8 +175,8 @@ jobs:
     if: needs.preflight.outputs.safe_to_trade != 'true'
 
     steps:
-      - name: Log Skip
+      - name: Skip Log
         run: |
-          echo "⏭ SKIPPED RUN"
+          echo "⏭ SKIPPED"
           echo "market=${{ needs.preflight.outputs.market_status }}"
           echo "safe=${{ needs.preflight.outputs.safe_to_trade }}"
