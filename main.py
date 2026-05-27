@@ -309,6 +309,16 @@ class TradingBot:
         decisions_map = {d["ticker"]: d for d in validated}
         current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
         _profile_settings = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
+        min_trade_value = _profile_settings.get("min_trade_value", 100.0)
+        if total_value < 10000:
+            dynamic_min = max(1.0, round(total_value * 0.10, 2))
+            if dynamic_min < min_trade_value:
+                log.info(
+                    f"Small account detected: lowering min_trade_value from "
+                    f"${min_trade_value:.2f} to ${dynamic_min:.2f}"
+                )
+                min_trade_value = dynamic_min
+
         planned_trades = self.portfolio.calculate_rebalancing_trades(
             target_allocations={
                 d["ticker"]: d.get("target_allocation", 0)
@@ -317,7 +327,7 @@ class TradingBot:
             },
             current_prices=current_prices,
             decisions_map=decisions_map,
-            min_trade_value=_profile_settings.get("min_trade_value", 100.0),
+            min_trade_value=min_trade_value,
         )
         projected_portfolio = self.portfolio.simulate_trade_plan(
             trades=planned_trades,
