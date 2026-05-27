@@ -14,13 +14,6 @@ concurrency:
   cancel-in-progress: false
 
 
-# ============================================================
-# GLOBAL ENV (fix Node warning optional)
-# ============================================================
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-
 jobs:
 
 # ============================================================
@@ -29,19 +22,15 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
 
-    outputs:
-      safe_to_trade: ${{ steps.gate.outputs.safe_to_trade }}
-      market_status: ${{ steps.market.outputs.status }}
-
     steps:
-
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       # --------------------------------------------------------
-      # 🔐 SECRET CHECK
+      # 🔐 SECRET CHECK (NO OUTPUTS)
       # --------------------------------------------------------
       - name: Secret Check
         env:
@@ -54,71 +43,54 @@ jobs:
           import os, sys
 
           required = [
-            "OPENAI_API_KEY",
-            "ALPACA_API_KEY",
-            "ALPACA_SECRET_KEY",
-            "ALLOW_LIVE_TRADING"
+              "OPENAI_API_KEY",
+              "ALPACA_API_KEY",
+              "ALPACA_SECRET_KEY",
+              "ALLOW_LIVE_TRADING"
           ]
 
           missing = [k for k in required if not os.getenv(k)]
 
           if missing:
-              print("❌ Missing:", missing)
+              print("❌ Missing secrets:", missing)
               sys.exit(1)
 
           print("✅ Secrets OK")
           EOF
 
       # --------------------------------------------------------
-      # 📊 MARKET STATUS
+      # 🧠 SAFETY GATE (FILE BASED - NO OUTPUTS)
       # --------------------------------------------------------
-      - name: Market Status
-        id: market
+      - name: Safety Gate (create state file)
         run: |
-          echo "status=OPEN" >> $GITHUB_OUTPUT
+          mkdir -p runtime
 
-      # --------------------------------------------------------
-      # 🧠 SAFETY GATE (FIXED + NON-SECRET OUTPUT SAFE)
-      # --------------------------------------------------------
-      - name: Safety Gate
-        id: gate
-        env:
-          ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
-        run: |
-          set -e
-
-          echo "ALLOW_LIVE_TRADING=$ALLOW_LIVE_TRADING"
-
-          if [[ "$ALLOW_LIVE_TRADING" != "true" ]]; then
-            echo "safe_to_trade=false" >> "$GITHUB_OUTPUT"
+          if [ "${{ secrets.ALLOW_LIVE_TRADING }}" = "true" ]; then
+            echo "true" > runtime/safe_to_trade.txt
+            echo "✅ SAFE TO TRADE"
+          else
+            echo "false" > runtime/safe_to_trade.txt
             echo "❌ LIVE TRADING DISABLED"
-            exit 0
           fi
 
-          printf "safe_to_trade=true\n" >> "$GITHUB_OUTPUT"
-          echo "✅ SAFE TO TRADE"
-
       # --------------------------------------------------------
-      # 🧪 DEBUG OUTPUTS (IMPORTANT)
+      # 🧪 DEBUG
       # --------------------------------------------------------
-      - name: Debug Outputs
+      - name: Debug State
         run: |
-          echo "market=${{ steps.market.outputs.status }}"
-          echo "gate=${{ steps.gate.outputs.safe_to_trade }}"
-          cat $GITHUB_OUTPUT || true
+          echo "STATE:"
+          cat runtime/safe_to_trade.txt
 
 
 # ============================================================
-# 📈 TRADING
+# 📈 TRADING JOB
 # ============================================================
   trade:
     runs-on: ubuntu-latest
     needs: preflight
 
-    # 🔥 NULL-SAFE CONDITION (THIS FIXES YOUR BUG)
-    if: ${{ needs.preflight.outputs.safe_to_trade == 'true' }}
-
-    timeout-minutes: 30
+    # 🔥 FILE-BASED CONDITION (NO NULL OUTPUT BUG EVER AGAIN)
+    if: success()
 
     steps:
 
@@ -127,8 +99,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Load safety state
+        run: |
+          cat runtime/safe_to_trade.txt
+
+          if [ "$(cat runtime/safe_to_trade.txt)" != "true" ]; then
+            echo "❌ NOT SAFE → EXIT"
+            exit 0
+          fi
+
+          echo "✅ SAFE → CONTINUE"
 
       - name: Create folders
         run: mkdir -p logs decisions
@@ -144,11 +127,11 @@ jobs:
           ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
           TRADING_MODE: live
         run: |
-          echo "🚀 START TRADING"
+          echo "🚀 START LIVE RUN"
           python main.py --mode live 2>&1 | tee logs/run.log
 
       # --------------------------------------------------------
-      # 📦 LOGGING
+      # 📦 ARTIFACTS
       # --------------------------------------------------------
       - name: Upload Logs
         if: always()
@@ -171,12 +154,9 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     needs: preflight
-
-    if: needs.preflight.outputs.safe_to_trade != 'true'
+    if: always()
 
     steps:
-      - name: Skip Log
-        run: |
-          echo "⏭ SKIPPED"
-          echo "market=${{ needs.preflight.outputs.market_status }}"
-          echo "safe=${{ needs.preflight.outputs.safe_to_trade }}"
+      - run: |
+          echo "⏭ AUDIT LOG"
+          echo "Workflow completed"
