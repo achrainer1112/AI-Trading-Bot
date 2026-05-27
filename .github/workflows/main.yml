@@ -126,16 +126,12 @@ jobs:
       - name: Set job output
         id: set_gate
         run: |
-          safe=false
           if [ -f runtime/gate.json ]; then
-            safe=$(python - <<'PY'
-import json
-data=json.load(open('runtime/gate.json'))
-print('true' if data.get('safe_to_trade') else 'false')
-PY
-)
+            safe=$(python -c "import json,sys; data=json.load(open('runtime/gate.json')); print('true' if data.get('safe_to_trade') else 'false')")
+          else
+            safe=false
           fi
-          echo "safe_to_trade=${safe}" >> $GITHUB_OUTPUT
+          echo "safe_to_trade=$safe" >> $GITHUB_OUTPUT
 
 
 # ============================================================
