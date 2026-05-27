@@ -524,6 +524,7 @@ class PortfolioOptimizer:
             self.MAX_SECTOR_PCT    = risk_settings.get("max_sector_exposure",self.MAX_SECTOR_PCT)
             self.MIN_SCORE_FOR_BUY = risk_settings.get("min_buy_score",     self.MIN_SCORE_FOR_BUY)
 
+
     def optimize(
         self,
         scores: Dict[str, "ScoreBreakdown"],
@@ -531,58 +532,45 @@ class PortfolioOptimizer:
         total_value: float = 100_000.0,
     ) -> "PortfolioAllocation":
         """
-        Build an optimal target portfolio allocation.
-
-        Returns a PortfolioAllocation with:
-          - target_allocations: {ticker: float}  (0.0–MAX_POSITION_PCT)
-          - recommended_sells: list of tickers to exit
-          - cash_target: float  (remaining cash fraction)
-          - rationale: dict of per-ticker reasoning
+        Build an optimal target portfolio allocation using risk-adjusted scoring
+        and diversification constraints. This is the core portfolio construction engine.
         """
         current_positions = current_positions or {}
 
-        # 1. Compute risk-adjusted score = score / (volatility + epsilon)
-        scored = []
+        # 1. Compute risk-adjusted score = score / volatility (higher is better)
+        candidates = []
         for ticker, sb in scores.items():
-            vol = sb.volatility_annual or 20.0
-            risk_adj = sb.total_score / (vol + 1e-6) * 10.0  # scale for readability
-            scored.append((ticker, sb, risk_adj))
+            vol = max(sb.volatility_annual or 20.0, 5.0)  # mind. 5% Vola
+            risk_adj = sb.total_score / vol  # direktes Verhältnis
+            candidates.append((ticker, sb, risk_adj))
 
         # 2. Sort by risk-adjusted score descending
-        scored.sort(key=lambda x: x[2], reverse=True)
+        candidates.sort(key=lambda x: x[2], reverse=True)
 
-        # 3. Select buy candidates: score >= threshold
-        buy_candidates = [
-            (t, sb, ra) for t, sb, ra in scored
-            if sb.total_score >= self.MIN_SCORE_FOR_BUY
-        ]
+        # 3. Apply correlation filtering: keep best from each correlated group
+        filtered = self._filter_correlated(candidates)
 
-        # 4. Apply correlation filtering: keep best from each correlated group
-        buy_candidates = self._filter_correlated(buy_candidates)
+        # 4. Apply sector cap
+        filtered = self._filter_sector_cap(filtered)
 
-        # 5. Apply sector cap: prune excess concentration
-        buy_candidates = self._filter_sector_cap(buy_candidates)
+        # 5. Limit to TARGET_MAX_POS (max 8)
+        filtered = filtered[:self.TARGET_MAX_POS]
 
-        # 6. Limit to TARGET_MAX_POS
-        buy_candidates = buy_candidates[:self.TARGET_MAX_POS]
+        # 6. Compute target allocations using risk-adjusted score weighting
+        target_allocations = {}
+        rationale = {}
+        investable_budget = 1.0 - self.MIN_CASH_PCT
 
-        # 7. Compute target allocations using score-weighted sizing
-        target_allocations: Dict[str, float] = {}
-        rationale: Dict[str, str] = {}
-        investable_budget = 1.0 - self.MIN_CASH_PCT  # e.g. 0.90
-
-        if buy_candidates:
-            total_ra = sum(ra for _, _, ra in buy_candidates)
-            for ticker, sb, ra in buy_candidates:
-                raw_alloc = (ra / total_ra) * investable_budget if total_ra > 0 else investable_budget / len(buy_candidates)
+        if filtered:
+            total_ra = sum(ra for _, _, ra in filtered)
+            for ticker, sb, ra in filtered:
+                raw_alloc = (ra / total_ra) * investable_budget if total_ra > 0 else investable_budget / len(filtered)
                 # Cap per-position
                 alloc = min(raw_alloc, self.MAX_POSITION_PCT)
                 target_allocations[ticker] = round(alloc, 4)
-                vol_str = f"{sb.volatility_annual:.0f}%" if sb.volatility_annual else "n/a"
                 rationale[ticker] = (
-                    f"Score={sb.total_score:.0f} | RiskAdj={ra:.1f} | "
-                    f"Sector={self.sector_map.get(ticker, 'other')} | Vola={vol_str} | "
-                    f"Alloc={alloc:.1%}"
+                    f"RiskAdj={ra:.2f} | Score={sb.total_score:.0f} | Vola={sb.volatility_annual:.0f}% | "
+                    f"Sector={self.sector_map.get(ticker, 'other')}"
                 )
 
         # Normalize if total exceeds investable budget
@@ -591,7 +579,7 @@ class PortfolioOptimizer:
             scale = investable_budget / total_alloc
             target_allocations = {t: round(a * scale, 4) for t, a in target_allocations.items()}
 
-        # 8. Identify sells: current positions not in buy list and score < HOLD
+        # 7. Identify sells: current positions not in target and score < HOLD
         recommended_sells = []
         for ticker, pos in current_positions.items():
             if pos.get("market_value", 0) <= 0:
@@ -603,11 +591,12 @@ class PortfolioOptimizer:
                 recommended_sells.append(ticker)
 
         cash_target = round(1.0 - sum(target_allocations.values()), 4)
+        cash_target = max(cash_target, self.MIN_CASH_PCT)
 
         return PortfolioAllocation(
             target_allocations=target_allocations,
             recommended_sells=recommended_sells,
-            cash_target=max(cash_target, self.MIN_CASH_PCT),
+            cash_target=cash_target,
             rationale=rationale,
         )
 
