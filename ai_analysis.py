@@ -311,7 +311,7 @@ class AIAnalyzer:
                 response_format={"type": "json_object"},
             )
             raw_text = response.choices[0].message.content
-            result = self._parse_response(raw_text, scores)
+            result = self._parse_response(raw_text, scores, portfolio_allocation)
 
             # Post-filter: nur erlaubte Ticker
             allowed = set(watchlist)
@@ -355,7 +355,7 @@ class AIAnalyzer:
             "current_alloc": sb.current_alloc,
         }
 
-    def _parse_response(self, raw_text: str, scores: Dict[str, ScoreBreakdown]) -> Dict:
+    def _parse_response(self, raw_text: str, scores: Dict[str, ScoreBreakdown], portfolio_allocation=None) -> Dict:
         """Parst und validiert die JSON-Antwort. Enforces score-based guardrails."""
         try:
             clean = re.sub(r"```json\s*|\s*```", "", raw_text).strip()
@@ -366,6 +366,11 @@ class AIAnalyzer:
 
             valid_decisions = []
             min_buy_score = self.risk_settings.get("min_buy_score", 60)
+
+            # Prepare optimizer ticker set for override
+            optimizer_tickers = set()
+            if portfolio_allocation is not None:
+                optimizer_tickers = set(portfolio_allocation.target_allocations.keys())
 
             for d in data["decisions"]:
                 missing = [k for k in ("ticker", "action", "target_allocation", "confidence") if k not in d]
@@ -381,37 +386,35 @@ class AIAnalyzer:
                 d["confidence"] = max(0.0, min(1.0, float(d["confidence"])))
                 d["reason"] = str(d.get("reason", ""))[:200]
 
-                # ── LLM-DECOUPLING: Quant Score is immutable ──
-                # LLM can provide narrative context, but NOT score adjustments.
-                # effective_score = quant_score (always, no LLM adjustment)
-                
                 ticker = d["ticker"]
                 quant_score = float(d.get("quant_score", 0))
                 
-                # If quant_score missing, use score engine result
                 if quant_score == 0 and ticker in scores:
                     quant_score = scores[ticker].total_score
                     d["quant_score"] = quant_score
                 
-                # LLM adjustments are IGNORED (decoupled)
-                d["llm_score_adj"] = 0.0  # Always zero (not used)
-                effective_score = quant_score  # NEVER adjusted by LLM
+                d["llm_score_adj"] = 0.0
+                effective_score = quant_score
                 
-                # Guardrail: prevent BUY below minimum score (based on pure quant)
-                if d["action"] == "BUY" and effective_score < min_buy_score:
+                # Guardrail: BUY blockieren wenn Score zu niedrig – AUSSER wenn vom PortfolioOptimizer vorgeschlagen
+                is_optimizer_suggestion = ticker in optimizer_tickers
+                if d["action"] == "BUY" and effective_score < min_buy_score and not is_optimizer_suggestion:
                     log.warning(
                         f"[GUARDRAIL] {ticker}: BUY blockiert "
                         f"(effective_score={effective_score:.1f} < min={min_buy_score})"
                     )
                     d["action"] = "HOLD"
                     d["reason"] = f"{d['reason']} [GUARDRAIL: score too low]"
+                elif d["action"] == "BUY" and effective_score < min_buy_score and is_optimizer_suggestion:
+                    log.info(
+                        f"[GUARDRAIL OVERRIDE] {ticker}: PortfolioOptimizer BUY akzeptiert "
+                        f"trotz Score {effective_score:.1f} < {min_buy_score}"
+                    )
 
-                # Guardrail: SELL with high confidence score stays SELL
                 if d["action"] == "SELL" and d.get("target_allocation", 0) > 0.5:
                     d["target_allocation"] = 0.0
                     log.warning(f"{ticker}: SELL mit hoher target_allocation → korrigiert auf 0")
 
-                # Ensure reasoning has metrics
                 if "reasoning" not in d or not isinstance(d.get("reasoning"), dict):
                     if ticker in scores:
                         d["reasoning"] = self._build_reasoning_from_score(scores[ticker])
