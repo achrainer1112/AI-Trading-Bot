@@ -25,6 +25,7 @@ pytz>=2023.3
 schedule>=1.2.0
 
 # Dashboard (optional)
+matplotlib>=3.8.0
 streamlit>=1.35.0
 plotly>=5.20.0
 
