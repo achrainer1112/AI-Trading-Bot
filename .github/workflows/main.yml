@@ -1,58 +1,51 @@
-name: 🤖 AI Trading Bot – Daily Live Run (ROBUST)
+name: 🤖 AI Trading Bot – Daily Run (STABLE)
 
 on:
   schedule:
     - cron: "0 17 * * 1-5"
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "Trading mode"
-        required: false
-        default: "live"
 
 permissions:
   contents: read
 
 concurrency:
-  group: trading-bot-live
+  group: trading-bot
   cancel-in-progress: false
 
 
 # ============================================================
-# 1) PREFLIGHT JOB (SAFE GATE)
+# 1) PREFLIGHT
 # ============================================================
 jobs:
   preflight:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: pip install requests pytz python-dotenv
 
-      # -----------------------------
-      # SECRET VALIDATION
-      # -----------------------------
-      - name: 🔐 Validate secrets
+      # -------------------------
+      # SECRET CHECK
+      # -------------------------
+      - name: 🔐 Secrets check
         run: |
           python - <<'EOF'
           import os, sys
 
-          required = [
+          keys = [
               "OPENAI_API_KEY",
               "ALPACA_API_KEY",
               "ALPACA_SECRET_KEY",
               "ALLOW_LIVE_TRADING"
           ]
 
-          missing = [k for k in required if not os.getenv(k)]
+          missing = [k for k in keys if not os.getenv(k)]
 
           if missing:
               print("❌ Missing:", missing)
@@ -70,45 +63,56 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
 
-      # -----------------------------
-      # ALPACA CHECK
-      # -----------------------------
-      - name: 🏥 Alpaca health check
+      # -------------------------
+      # ALPACA DEBUG (IMPORTANT FIX)
+      # -------------------------
+      - name: 🏥 Alpaca debug check
         run: |
           python - <<'EOF'
-          import os, requests, json
+          import os, requests, sys
+
+          api_key = os.getenv("ALPACA_API_KEY")
+          secret  = os.getenv("ALPACA_SECRET_KEY")
+
+          print("KEY PRESENT:", bool(api_key))
+          print("SECRET PRESENT:", bool(secret))
+
+          # CHANGE THIS IF PAPER ACCOUNT
+          url = "https://api.alpaca.markets/v2/account"
 
           headers = {
-              "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY"),
-              "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY"),
+              "APCA-API-KEY-ID": api_key,
+              "APCA-API-SECRET-KEY": secret,
           }
 
-          r = requests.get("https://api.alpaca.markets/v2/account", headers=headers)
+          r = requests.get(url, headers=headers, timeout=10)
+
+          print("STATUS:", r.status_code)
+          print("BODY:", r.text)
 
           if r.status_code != 200:
-              raise SystemExit("API FAIL")
+              sys.exit(1)
 
           data = r.json()
 
           if data.get("status") != "ACTIVE":
-              raise SystemExit("NOT ACTIVE")
+              sys.exit(1)
 
           if data.get("trading_blocked"):
-              raise SystemExit("BLOCKED")
+              sys.exit(1)
 
           print("SAFE")
-
-          import os
-          os.makedirs("runtime", exist_ok=True)
-
-          with open("runtime/gate.json", "w") as f:
-              json.dump({"safe_to_trade": True}, f)
           EOF
 
-      # -----------------------------
-      # UPLOAD GATE ARTIFACT
-      # -----------------------------
-      - name: 📦 Upload gate artifact
+      # -------------------------
+      # WRITE GATE FILE (NO OUTPUTS EVER)
+      # -------------------------
+      - name: Create gate file
+        run: |
+          mkdir -p runtime
+          echo '{"safe_to_trade": true}' > runtime/gate.json
+
+      - name: Upload gate
         uses: actions/upload-artifact@v4
         with:
           name: gate
@@ -121,18 +125,14 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     needs: preflight
-
-    # 🔥 IMPORTANT: NO OUTPUT DEPENDENCY (this fixes your null bug)
     if: success()
 
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -141,19 +141,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 📁 Create folders
+      - name: Create folders
         run: mkdir -p logs decisions runtime
 
-      # -----------------------------
-      # DOWNLOAD GATE (ROBUST STATE TRANSFER)
-      # -----------------------------
-      - name: 📥 Download preflight gate
+      # -------------------------
+      # LOAD GATE (ROBUST)
+      # -------------------------
+      - name: Download gate
         uses: actions/download-artifact@v4
         with:
           name: gate
           path: runtime
 
-      - name: 🔍 Verify gate
+      - name: Verify gate
         run: |
           python - <<'EOF'
           import json, sys
@@ -162,16 +162,16 @@ jobs:
               data = json.load(f)
 
           if not data.get("safe_to_trade"):
-              print("❌ NOT SAFE")
+              print("NOT SAFE")
               sys.exit(1)
 
-          print("✅ SAFE TO TRADE")
+          print("SAFE TO TRADE")
           EOF
 
-      # -----------------------------
-      # TRADING EXECUTION
-      # -----------------------------
-      - name: 🤖 Run Trading Bot
+      # -------------------------
+      # TRADE EXECUTION
+      # -------------------------
+      - name: Run bot
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -180,20 +180,19 @@ jobs:
           TRADING_MODE: live
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "🚀 Trading start"
+          echo "START TRADE"
           date -u
 
           python main.py --mode live 2>&1 | tee logs/run.log
           EXIT=$?
 
-          echo "Exit: $EXIT"
-
+          echo "EXIT CODE: $EXIT"
           exit $EXIT
 
-      # -----------------------------
+      # -------------------------
       # SNAPSHOT
-      # -----------------------------
-      - name: 📊 Snapshot
+      # -------------------------
+      - name: Snapshot
         if: always()
         run: |
           python - <<'EOF'
@@ -210,17 +209,17 @@ jobs:
           print("snapshot ok")
           EOF
 
-      # -----------------------------
+      # -------------------------
       # ARTIFACTS
-      # -----------------------------
-      - name: 📦 Upload logs
+      # -------------------------
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs
           path: logs/
 
-      - name: 📦 Upload decisions
+      - name: Upload decisions
         if: always()
         uses: actions/upload-artifact@v4
         with:
