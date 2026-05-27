@@ -100,6 +100,43 @@ class LiveTradingGuard:
 
 
 # -----------------------------------------------------------------------------
+# Capital safety checks
+# -----------------------------------------------------------------------------
+
+class CapitalSafetyChecker:
+    def __init__(self, min_cash_pct: float = 0.10, max_position_pct: float = 0.20):
+        self.min_cash_pct = min_cash_pct
+        self.max_position_pct = max_position_pct
+
+    def check_buy(
+        self,
+        ticker: str,
+        buy_value: float,
+        available_cash: float,
+        total_value: float,
+        current_position_value: float = 0.0,
+    ) -> bool:
+        if total_value <= 0:
+            raise CapitalSafetyError("Ungültiger Portfoliowert für Kapitalprüfung.")
+
+        required_cash_reserve = total_value * self.min_cash_pct
+        if buy_value > max(0.0, available_cash - required_cash_reserve):
+            raise CapitalSafetyError(
+                f"Kauf von {ticker} in Höhe von ${buy_value:.2f} würde den Mindestliquiditätspuffer "
+                f"von {required_cash_reserve:.2f} USD unterschreiten."
+            )
+
+        max_position_value = total_value * self.max_position_pct
+        if current_position_value + buy_value > max_position_value:
+            raise CapitalSafetyError(
+                f"Kauf von {ticker} in Höhe von ${buy_value:.2f} würde die maximale Positionsgrenze "
+                f"von {max_position_value:.2f} USD für dieses Portfolio überschreiten."
+            )
+
+        return True
+
+
+# -----------------------------------------------------------------------------
 # Drawdown kill-switch
 # -----------------------------------------------------------------------------
 
