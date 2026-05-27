@@ -309,6 +309,7 @@ class TradingBot:
         decisions_map = {d["ticker"]: d for d in validated}
         current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
         _profile_settings = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
+        total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
         min_trade_value = _profile_settings.get("min_trade_value", 100.0)
         if total_value < 10000:
             dynamic_min = max(1.0, round(total_value * 0.10, 2))
@@ -318,6 +319,18 @@ class TradingBot:
                     f"${min_trade_value:.2f} to ${dynamic_min:.2f}"
                 )
                 min_trade_value = dynamic_min
+
+        log.info(
+            f"  Rebalancing candidates: {sum(1 for d in validated if d.get('action') == 'BUY' and d.get('risk_approved', False))} BUY(s), "
+            f"{sum(1 for d in validated if d.get('action') == 'SELL' and d.get('risk_approved', False))} SELL(s) | "
+            f"min_trade_value=${min_trade_value:.2f}"
+        )
+        for d in validated:
+            if d.get("action") in ("BUY", "SELL") and d.get("risk_approved", False):
+                log.debug(
+                    f"    candidate: {d['ticker']} {d['action']} target_alloc={d.get('target_allocation',0):.2%} "
+                    f"confidence={d.get('confidence',0):.0%} reason={d.get('reason','')}"
+                )
 
         planned_trades = self.portfolio.calculate_rebalancing_trades(
             target_allocations={
@@ -346,6 +359,14 @@ class TradingBot:
             d for d in validated
             if not d.get("risk_approved", True)
         ]
+
+        if not planned_trades and approved_trades:
+            log.warning("  APPROVED trades exist, but rebalancing generated 0 executable orders.")
+            for d in approved_trades:
+                log.warning(
+                    f"    • {d['ticker']} {d['action']} target_alloc={d.get('target_allocation',0):.2%} "
+                    f"confidence={d.get('confidence',0):.0%} reason={d.get('reason','')}"
+                )
 
         run_summary.update({
             "recommended_signals": len(raw_decisions),
