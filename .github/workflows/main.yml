@@ -21,6 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       safe_to_trade: ${{ steps.set_gate.outputs.safe_to_trade }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
 
     steps:
       - uses: actions/checkout@v4
