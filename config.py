@@ -1,10 +1,14 @@
 """
-AI Trading Bot - Konfigurationsdatei
-=====================================
-PHASE 4A: Live Trading Migration
-  - TRADING_MODE → LIVE
-  - ALLOW_LIVE_TRADING als harter Gate (muss explizit True gesetzt werden)
-  - Kein Fallback auf PAPER wenn LIVE nicht erlaubt → SYSTEM STOP
+AI Trading Bot - Konfigurationsdatei (Erweitert)
+=================================================
+PHASE 4A: Live Trading Migration + Erweiterte Risikoparameter
+
+Neue Parameter:
+  - MAX_DAILY_LOSS_PCT (für Emergency Cash Mode / Circuit Breaker)
+  - CAPITAL_ROTATION_MIN_SCORE_DIFF
+  - CAPITAL_ROTATION_MAX_PER_RUN
+  - DYNAMIC_POSITION_SIZING_ENABLED
+  - VOLATILITY_TARGET (für dynamisches Sizing)
 """
 
 import os
@@ -17,25 +21,17 @@ load_dotenv()
 # ─────────────────────────────────────────────
 # TRADING MODUS – PHASE 4A: LIVE
 # ─────────────────────────────────────────────
-TRADING_MODE = os.getenv("TRADING_MODE", "LIVE")   # ← PAPER → LIVE
+TRADING_MODE = os.getenv("TRADING_MODE", "LIVE")
 
 # ─────────────────────────────────────────────
-# LIVE TRADING GATE  ← NEU (Phase 4A)
+# LIVE TRADING GATE
 # ─────────────────────────────────────────────
-# MUSS in .env auf true gesetzt werden:
-#   ALLOW_LIVE_TRADING=true
-#
-# Wenn False UND TRADING_MODE=LIVE:
-#   → SYSTEM STOP – kein Fallback, kein Paper
-#
 ALLOW_LIVE_TRADING: bool = os.getenv("ALLOW_LIVE_TRADING", "false").strip().lower() == "true"
 
 # ─────────────────────────────────────────────
-# DRAWDOWN KILL-SWITCH  ← NEU (Phase 4A)
+# DRAWDOWN KILL-SWITCH
 # ─────────────────────────────────────────────
-# Bei Portfolio-Drawdown >= KILL_SWITCH_DRAWDOWN_PCT:
-#   → cancel_all_orders() + flatten_all_positions() + disable trading
-KILL_SWITCH_DRAWDOWN_PCT: float = float(os.getenv("KILL_SWITCH_DRAWDOWN_PCT", "0.08"))  # default -8%
+KILL_SWITCH_DRAWDOWN_PCT: float = float(os.getenv("KILL_SWITCH_DRAWDOWN_PCT", "0.08"))
 
 # ─────────────────────────────────────────────
 # API KEYS
@@ -45,15 +41,12 @@ OPENAI_MODEL = "gpt-4o-mini"
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-
-# Phase 4A: LIVE → echte Alpaca-URL verwenden
-# Für LIVE muss ALPACA_BASE_URL in der .env auf https://api.alpaca.markets gesetzt werden
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# RISIKOPROFILE
+# RISIKOPROFILE (erweitert)
 # ─────────────────────────────────────────────
 class RiskProfile(Enum):
     CONSERVATIVE = "conservative"
@@ -79,6 +72,10 @@ RISK_SETTINGS = {
         "volatility_target": 0.10,
         "max_drawdown_trigger": 0.15,
         "min_buy_score": 65,
+        # NEU: Circuit Breaker / Emergency Cash Mode
+        "max_daily_loss_pct": 0.03,      # 3% Tagesverlust löst Emergency Cash aus
+        "max_intraday_loss_pct": 0.05,   # 5% Intraday-Verlust löst CB1 aus
+        "vix_panic_threshold": 30.0,     # VIX über 30 löst DE_RISK_50 aus
     },
     RiskProfile.BALANCED: {
         "max_position_pct": 0.20,
@@ -97,6 +94,10 @@ RISK_SETTINGS = {
         "volatility_target": 0.15,
         "max_drawdown_trigger": 0.20,
         "min_buy_score": 60,
+        # NEU
+        "max_daily_loss_pct": 0.05,
+        "max_intraday_loss_pct": 0.07,
+        "vix_panic_threshold": 35.0,
     },
     RiskProfile.AGGRESSIVE: {
         "max_position_pct": 0.30,
@@ -115,10 +116,39 @@ RISK_SETTINGS = {
         "volatility_target": 0.25,
         "max_drawdown_trigger": 0.30,
         "min_buy_score": 55,
+        # NEU
+        "max_daily_loss_pct": 0.08,
+        "max_intraday_loss_pct": 0.10,
+        "vix_panic_threshold": 40.0,
     },
 }
 
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
+
+# ─────────────────────────────────────────────
+# CAPITAL ROTATION (neu)
+# ─────────────────────────────────────────────
+CAPITAL_ROTATION_ENABLED = True
+CAPITAL_ROTATION_MIN_SCORE_DIFF = 15.0      # Mindest-Score-Differenz für Rotation
+CAPITAL_ROTATION_MAX_PER_RUN = 2            # Max. Rotationen pro Run
+CAPITAL_ROTATION_MIN_VALUE_USD = 100.0      # Mindestwert für Rotation
+CAPITAL_ROTATION_MIN_HOLD_DAYS = 5          # Position muss mind. 5 Tage gehalten sein
+
+# ─────────────────────────────────────────────
+# DYNAMIC POSITION SIZING (neu)
+# ─────────────────────────────────────────────
+DYNAMIC_POSITION_SIZING_ENABLED = True
+VOLATILITY_TARGET = 0.15                    # Zielvolatilität für Skalierung
+MAX_VOLATILITY_FACTOR = 2.0
+MIN_VOLATILITY_FACTOR = 0.5
+
+# ─────────────────────────────────────────────
+# SCORE GUARDRAILS (neu)
+# ─────────────────────────────────────────────
+SCORE_GUARDRAIL_STRICT = True
+SCORE_MIN_FOR_BUY = 50                      # Absolutes Minimum
+SCORE_MIN_FOR_BUY_BEAR = 65                 # Höheres Minimum im Bärenmarkt
+SCORE_BUY_WITHOUT_GUARDRAIL = 60            # Ohne Guardrail-Override
 
 # ─────────────────────────────────────────────
 # WATCHLIST & ETFs
