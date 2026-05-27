@@ -508,7 +508,7 @@ class PortfolioOptimizer:
     MAX_SECTOR_PCT     = 0.45
     TARGET_MIN_POS     = 3
     TARGET_MAX_POS     = 8
-    MIN_SCORE_FOR_BUY  = SCORE_BUY  # 60
+    MIN_SCORE_FOR_BUY  = 50  
 
     def __init__(
         self,
