@@ -2,10 +2,16 @@
 AI Trading Bot - Marktdaten-Collector (Enhanced)
 ==================================================
 Sammelt erweiterte Metriken für alle Watchlist-Assets:
-  - SMA20, SMA50, SMA90
-  - Momentum 20d (separater Wert)
+  - SMA20, SMA50, SMA90, SMA200
+  - Momentum 20d/30d/60d
   - Relative Strength vs SPY
-  - Erweitertes RSI
+  - RSI
+  - MACD
+  - Bollinger Bands
+  - ATR (Average True Range)
+  - EMA12, EMA26 (für Crossover)
+  - Open Gap
+  - 52w High/Low
 """
 
 from datetime import datetime, timedelta
@@ -40,16 +46,16 @@ class MarketDataCollector:
         """Lädt historische OHLCV-Daten für einen Ticker."""
         try:
             end = datetime.today()
-            start = end - timedelta(days=days + 20)   # Puffer
+            start = end - timedelta(days=days + 120)   # extra Puffer für Indikatoren
             df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
             if df is None or getattr(df, "empty", True):
                 log.warning(f"Keine Daten für {ticker}")
                 return None
 
-            # Robust Column Normalization: handle MultiIndex and inconsistent column names
+            # Normalisiere Spaltennamen
             df = self._normalize_ohlcv_columns(df)
 
-            # Ensure index is datetime and sorted
+            # Stelle sicher, dass Index datetime ist und sortiert
             try:
                 df.index = pd.to_datetime(df.index)
                 df = df.sort_index()
@@ -65,7 +71,7 @@ class MarketDataCollector:
     def calculate_metrics(self, ticker: str, spy_close: Optional[pd.Series] = None) -> Dict:
         """
         Berechnet alle relevanten Metriken für einen Ticker.
-        Neu: SMA20, SMA50, momentum_20d, relative_strength, sma_distance_pct.
+        Neu: ATR, SMA200, EMA12, EMA26.
         """
         df = self.data_cache.get(ticker)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
@@ -74,6 +80,8 @@ class MarketDataCollector:
             return {}
 
         close = df["Close"]
+        high = df["High"] if "High" in df else close
+        low = df["Low"] if "Low" in df else close
         current_price = float(close.iloc[-1])
 
         def safe_return(days: int) -> Optional[float]:
@@ -85,11 +93,24 @@ class MarketDataCollector:
         return_7d  = safe_return(SHORT_WINDOW)
         return_20d = safe_return(MEDIUM_WINDOW)
         return_30d = safe_return(30)
+        return_60d = safe_return(60)
         return_90d = safe_return(EXTRA_LONG_WINDOW)
 
-        # Volatilität
+        # Volatilität (annualisiert)
         daily_returns = close.pct_change().dropna()
-        volatility = float(daily_returns.std() * np.sqrt(252) * 100)
+        volatility = float(daily_returns.std() * np.sqrt(252) * 100) if len(daily_returns) >= 5 else 20.0
+
+        # --- ATR (Average True Range, 14 Tage) ---
+        atr_14 = None
+        try:
+            if len(close) >= 15:
+                high_low = high - low
+                high_close = (high - close.shift()).abs()
+                low_close = (low - close.shift()).abs()
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                atr_14 = float(tr.rolling(14).mean().iloc[-1])
+        except Exception:
+            atr_14 = None
 
         # --- MACD (12,26,9) ---
         macd_line = macd_signal = macd_hist = None
@@ -103,9 +124,19 @@ class MarketDataCollector:
                 macd_signal = float(macd_sig.iloc[-1])
                 macd_hist = float(macd_line - macd_signal)
         except Exception:
-            macd_line = macd_signal = macd_hist = None
+            pass
 
-        # --- Bollinger Bands (20, 2σ) ---
+        # --- EMA12, EMA26 (zusätzlich für Crossover) ---
+        ema_12 = None
+        ema_26 = None
+        try:
+            if len(close) >= 26:
+                ema_12 = float(close.ewm(span=12, adjust=False).mean().iloc[-1])
+                ema_26 = float(close.ewm(span=26, adjust=False).mean().iloc[-1])
+        except Exception:
+            pass
+
+        # --- Bollinger Bands (20,2σ) ---
         bb_upper = bb_middle = bb_lower = bb_position = None
         try:
             if len(close) >= 20:
@@ -118,14 +149,14 @@ class MarketDataCollector:
                 if bb_upper is not None and bb_lower is not None and (bb_upper - bb_lower) != 0:
                     bb_position = float((current_price - bb_lower) / (bb_upper - bb_lower))
         except Exception:
-            bb_upper = bb_middle = bb_lower = bb_position = None
+            pass
 
         # Moving Averages
         sma_20 = float(close.tail(MEDIUM_WINDOW).mean()) if len(close) >= MEDIUM_WINDOW else None
         sma_50 = float(close.tail(LONG_WINDOW).mean()) if len(close) >= LONG_WINDOW else None
         sma_90 = float(close.tail(EXTRA_LONG_WINDOW).mean()) if len(close) >= EXTRA_LONG_WINDOW else None
-        # Legacy compatibility
-        sma_7  = float(close.tail(SHORT_WINDOW).mean())
+        sma_200 = float(close.tail(200).mean()) if len(close) >= 200 else None   # neu
+        sma_7  = float(close.tail(SHORT_WINDOW).mean()) if len(close) >= SHORT_WINDOW else current_price
 
         # SMA distance
         sma_distance_pct = None
@@ -139,7 +170,6 @@ class MarketDataCollector:
         relative_strength = None
         if spy_close is not None and ticker != "SPY":
             try:
-                # Align indices
                 aligned = pd.concat([close, spy_close], axis=1, join="inner")
                 aligned.columns = ["ticker", "spy"]
                 aligned = aligned.dropna()
@@ -151,10 +181,10 @@ class MarketDataCollector:
             except Exception:
                 pass
 
-        # Avg Volume
+        # Average Volume
         avg_volume = float(df["Volume"].tail(20).mean()) if "Volume" in df else None
 
-        # --- Open Gap % (Open today vs prev Close) ---
+        # Open Gap %
         open_gap_pct = None
         try:
             if "Open" in df and "Close" in df and len(df) >= 2:
@@ -163,7 +193,7 @@ class MarketDataCollector:
                 if prev_close != 0:
                     open_gap_pct = (open_today - prev_close) / prev_close * 100
         except Exception:
-            open_gap_pct = None
+            pass
 
         # 52-week high/low
         high_52w = low_52w = None
@@ -174,48 +204,39 @@ class MarketDataCollector:
         return {
             "ticker": ticker,
             "current_price": current_price,
-            # Returns
             "return_7d": return_7d,
             "return_20d": return_20d,
             "return_30d": return_30d,
+            "return_60d": return_60d,
             "return_90d": return_90d,
-            # Volatility
             "volatility_annual_pct": round(volatility, 2),
-            # SMAs
             "sma_7": round(sma_7, 2),
             "sma_20": round(sma_20, 2) if sma_20 else None,
             "sma_50": round(sma_50, 2) if sma_50 else None,
             "sma_90": round(sma_90, 2) if sma_90 else None,
-            # Legacy keys for compatibility
-            "sma_30": round(sma_50, 2) if sma_50 else None,
-            "sma_90_compat": round(sma_90, 2) if sma_90 else None,
-            # SMA flags
+            "sma_200": round(sma_200, 2) if sma_200 else None,   # neu
+            "sma_30": round(sma_50, 2) if sma_50 else None,  # legacy
             "above_sma_20": current_price > sma_20 if sma_20 else None,
-            "above_sma_30": current_price > sma_50 if sma_50 else None,   # kept for compat
+            "above_sma_30": current_price > sma_50 if sma_50 else None,
             "above_sma_50": current_price > sma_50 if sma_50 else None,
             "above_sma_90": current_price > sma_90 if sma_90 else None,
             "sma_distance_pct": round(sma_distance_pct, 2) if sma_distance_pct is not None else None,
-            # RSI
             "rsi_14": round(rsi, 2) if rsi is not None else None,
-            # Relative Strength
             "relative_strength_vs_spy": round(relative_strength, 4) if relative_strength else None,
-            # Volume
             "avg_volume_20d": int(avg_volume) if avg_volume else None,
-            # MACD
             "macd_line": round(macd_line, 6) if macd_line is not None else None,
             "macd_signal": round(macd_signal, 6) if macd_signal is not None else None,
             "macd_histogram": round(macd_hist, 6) if macd_hist is not None else None,
-            # Bollinger Bands
             "bb_upper": round(bb_upper, 4) if bb_upper is not None else None,
             "bb_middle": round(bb_middle, 4) if bb_middle is not None else None,
             "bb_lower": round(bb_lower, 4) if bb_lower is not None else None,
             "bb_position": round(bb_position, 4) if bb_position is not None else None,
-            # Open Gap
+            "atr_14": round(atr_14, 4) if atr_14 is not None else None,           # neu
+            "ema_12": round(ema_12, 2) if ema_12 is not None else None,           # neu
+            "ema_26": round(ema_26, 2) if ema_26 is not None else None,           # neu
             "open_gap_pct": round(open_gap_pct, 4) if open_gap_pct is not None else None,
-            # 52-week
             "high_52w": round(high_52w, 2) if high_52w else None,
             "low_52w": round(low_52w, 2) if low_52w else None,
-            # Meta
             "data_points": len(close),
             "last_updated": datetime.now().isoformat(),
         }
@@ -244,7 +265,6 @@ class MarketDataCollector:
         results = {}
         for ticker in self.watchlist:
             log.debug(f"  → Lade {ticker}")
-            # Wenn SPY schon im Cache, wird es wiederverwendet
             metrics = self.calculate_metrics(ticker, spy_close=spy_close if ticker != "SPY" else None)
             if metrics:
                 results[ticker] = metrics
@@ -252,7 +272,7 @@ class MarketDataCollector:
                     f"  ✓ {ticker}: ${metrics.get('current_price', 0):.2f} | "
                     f"20d: {metrics.get('return_20d', 0) or 0:+.1f}% | "
                     f"RSI: {metrics.get('rsi_14', 'n/a')} | "
-                    f"RS: {metrics.get('relative_strength_vs_spy', 'n/a')}"
+                    f"ATR: {metrics.get('atr_14', 'n/a')}"
                 )
             else:
                 log.warning(f"  ✗ Keine Daten für {ticker}")
@@ -274,12 +294,7 @@ class MarketDataCollector:
         return None
 
     def _normalize_ohlcv_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize dataframe columns to standard OHLCV names.
-
-        Handles MultiIndex columns and common variants like 'Adj Close'.
-        Leaves the dataframe intact if no mapping is found for a column.
-        """
-        # Flatten MultiIndex if present
+        """Normalize dataframe columns to standard OHLCV names."""
         try:
             if isinstance(df.columns, pd.MultiIndex):
                 df = df.copy()
@@ -289,7 +304,6 @@ class MarketDataCollector:
 
         cols_lower = {c.lower(): c for c in df.columns}
 
-        # Priority matches for each target column
         candidates = {
             "Open": ["open"],
             "High": ["high"],
@@ -303,7 +317,6 @@ class MarketDataCollector:
         for target, keys in candidates.items():
             found = None
             for k in keys:
-                # exact match
                 for col in available:
                     if col.lower() == k:
                         found = col
@@ -311,7 +324,6 @@ class MarketDataCollector:
                 if found:
                     break
             if not found:
-                # contains match
                 for k in keys:
                     for col in available:
                         if k in col.lower():
@@ -320,12 +332,7 @@ class MarketDataCollector:
                     if found:
                         break
             if found and found != target:
-                # avoid overwriting if target already present
-                if target in df.columns:
-                    # prefer adjusted close over plain close: if target exists and found is 'Adj Close', replace mapping
-                    if "adj" in found.lower() and target == "Close":
-                        rename_map[found] = target
-                else:
+                if target not in df.columns or ("adj" in found.lower() and target == "Close"):
                     rename_map[found] = target
 
         if rename_map:
