@@ -143,7 +143,7 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     needs: preflight
-    if: success() && needs.preflight.outputs.safe_to_trade == 'true'
+    if: needs.preflight.result == 'success'
 
     timeout-minutes: 30
 
