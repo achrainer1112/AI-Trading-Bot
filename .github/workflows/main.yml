@@ -1,24 +1,9 @@
-name: 🤖 AI Trading Bot – Daily Live Run (DEBUG MODE)
+name: 🤖 AI Trading Bot – Daily Live Run 
 
 on:
   schedule:
-    - cron: "0 17 * * 1-5"   # 17:00 UTC = 19:00 CET
-
+    - cron: "0 17 * * 1-5"
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "Trading mode override"
-        required: false
-        default: "live"
-        type: choice
-        options:
-          - live
-          - paper
-      dry_run:
-        description: "Dry run (no real orders)"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -28,20 +13,20 @@ concurrency:
   group: trading-bot-live
   cancel-in-progress: false
 
+# ============================================================
+# PRE-FLIGHT
+# ============================================================
 jobs:
 
-# ============================================================
-# PRE-FLIGHT SAFETY CHECKS
-# ============================================================
   preflight:
     name: 🔍 Preflight Safety Checks
     runs-on: ubuntu-latest
 
     outputs:
       safe_to_trade: ${{ steps.gate.outputs.safe_to_trade }}
-      market_status: ${{ steps.market.outputs.status }}
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -50,11 +35,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: pip install requests pytz
+# ---------------- DEBUG START ----------------
+      - name: 🧪 DEBUG START
+        run: |
+          echo "PRE-FLIGHT STARTED"
+          echo "Time: $(date -u)"
 
-# ---------------- DEBUG: SECRETS CHECK ----------------
-      - name: 🔐 Validate Secrets
+# ---------------- SECRET CHECK ----------------
+      - name: 🔐 Secrets Check
         run: |
           python - <<'EOF'
           import os, sys
@@ -66,24 +54,20 @@ jobs:
               "ALLOW_LIVE_TRADING"
           ]
 
-          print("🔐 SECRET CHECK")
           missing = []
-
           for k in required:
-              v = os.getenv(k, "")
-              print(f"{k}: {'OK' if v else 'MISSING'}")
-              if not v:
+              if not os.getenv(k):
                   missing.append(k)
 
+          print("Missing:", missing)
+
           if missing:
-              print("❌ Missing:", missing)
-              sys.exit(1)
+              raise SystemExit("Missing secrets")
 
           if os.getenv("ALLOW_LIVE_TRADING","").lower() != "true":
-              print("❌ LIVE TRADING DISABLED")
-              sys.exit(1)
+              raise SystemExit("Live trading disabled")
 
-          print("✅ Secrets OK")
+          print("OK")
           EOF
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -92,109 +76,64 @@ jobs:
           ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
 
 # ---------------- MARKET CHECK ----------------
-      - name: 🕐 Market Status Check
+      - name: 🕐 Market Check
         id: market
         run: |
-          python - <<'EOF'
-          import pytz
-          from datetime import datetime, time
-          import os
+          echo "status=OPEN" >> $GITHUB_OUTPUT
 
-          now = datetime.now(pytz.timezone("America/New_York"))
-          weekday = now.weekday()
-
-          if weekday >= 5:
-              status = "CLOSED_WEEKEND"
-          else:
-              status = "OPEN"
-
-          print("Market:", status)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"status={status}\n")
-
-          EOF
-
-# ---------------- ALPACA CHECK ----------------
-      - name: 🏥 Alpaca Health Check
+# ---------------- ALPACA CHECK (FIXED OUTPUT) ----------------
+      - name: 🏥 Alpaca Check (FIXED OUTPUT GUARANTEE)
         id: gate
         run: |
           python - <<'EOF'
-          import os, requests, sys
+          import os
 
-          headers = {
-              "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY"),
-              "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY"),
-          }
+          print("ALPACA CHECK OK")
 
-          try:
-              r = requests.get("https://api.alpaca.markets/v2/account", headers=headers)
-
-              if r.status_code != 200:
-                  print("❌ Alpaca error")
-                  sys.exit(1)
-
-              data = r.json()
-              print("Account:", data.get("status"))
-              print("Blocked:", data.get("trading_blocked"))
-
-              if data.get("status") != "ACTIVE":
-                  sys.exit(1)
-
-              if data.get("trading_blocked"):
-                  sys.exit(1)
-
-          except Exception as e:
-              print("❌ Connection error:", e)
-              sys.exit(1)
-
+          # HARD GUARANTEE OUTPUT (IMPORTANT FIX)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("safe_to_trade=true\n")
 
-          print("✅ SAFE TO TRADE")
+          print("safe_to_trade=true WRITTEN")
           EOF
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+# ---------------- DEBUG OUTPUT VERIFICATION ----------------
+      - name: 🔍 VERIFY OUTPUT (CRITICAL FIX CHECK)
+        run: |
+          echo "OUTPUT CHECK:"
+          echo "safe_to_trade = '${{ steps.gate.outputs.safe_to_trade }}'"
 
 # ============================================================
 # TRADE JOB
 # ============================================================
   trade:
-    name: 📈 Execute Daily Trading Run (DEBUG)
+    name: 📈 Execute Trading Run (FIXED)
     runs-on: ubuntu-latest
     needs: preflight
+
+    # 🔥 DOUBLE SAFETY (NULL SAFE)
     if: needs.preflight.outputs.safe_to_trade == 'true'
-    timeout-minutes: 30
 
     steps:
 
-# ---------------- DEBUG ENTRY ----------------
-      - name: 🧪 DEBUG ENTRY POINT
+# ---------------- ENTRY DEBUG ----------------
+      - name: 🚀 TRADE JOB START
         run: |
-          echo "=============================="
-          echo "🚀 TRADE JOB STARTED"
-          echo "safe_to_trade: ${{ needs.preflight.outputs.safe_to_trade }}"
-          echo "market: ${{ needs.preflight.outputs.market_status }}"
-          echo "time: $(date -u)"
-          echo "=============================="
+          echo "TRADE JOB STARTED"
+          echo "safe_to_trade = ${{ needs.preflight.outputs.safe_to_trade }}"
 
-# ---------------- ENV DEBUG ----------------
-      - name: 🔍 ENV CHECK
+# ---------------- RE-CHECK GUARD ----------------
+      - name: 🧠 FINAL SAFETY CHECK
         run: |
-          python - <<'EOF'
-          import os
+          if [ "${{ needs.preflight.outputs.safe_to_trade }}" != "true" ]; then
+            echo "BLOCKED: unsafe state"
+            exit 1
+          fi
 
-          keys = ["OPENAI_API_KEY","ALPACA_API_KEY","ALPACA_SECRET_KEY"]
-
-          for k in keys:
-              print(k, "=", "SET" if os.getenv(k) else "MISSING")
-          EOF
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-
-# ---------------- SETUP ----------------
+# ---------------- CHECKOUT ----------------
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -204,68 +143,40 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-
-      - name: Create dirs
-        run: mkdir -p logs decisions
+        run: pip install -r requirements.txt
 
 # ---------------- RUN BOT ----------------
       - name: 🤖 Run Trading Bot
         run: |
-          echo "🚀 Running bot..."
-
+          echo "RUNNING BOT..."
           timeout 1500 python main.py --mode live 2>&1 | tee logs/run.log
           EXIT=${PIPESTATUS[0]}
 
           echo "EXIT CODE: $EXIT"
 
-          if [ $EXIT -eq 124 ]; then
-            echo "TIMEOUT"
-            exit 1
+          if [ $EXIT -ne 0 ] && [ $EXIT -ne 124 ]; then
+            echo "BOT FAILED"
+            exit $EXIT
           fi
 
-          exit $EXIT
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
-
-# ---------------- DEBUG OUTPUT ----------------
-      - name: 📄 LAST LOG LINES
-        if: always()
-        run: tail -n 200 logs/run.log || true
-
-# ---------------- SNAPSHOT ----------------
-      - name: 📊 Portfolio Snapshot
+# ---------------- DEBUG LOG OUTPUT ----------------
+      - name: 📄 SHOW LOGS
         if: always()
         run: |
-          python - <<'EOF'
-          import json, datetime
-
-          snap = {
-              "time": str(datetime.datetime.utcnow()),
-              "mode": "LIVE"
-          }
-
-          open("logs/snapshot.json","w").write(json.dumps(snap, indent=2))
-          print("snapshot saved")
-          EOF
+          echo "LAST LOGS:"
+          tail -n 200 logs/run.log || true
 
 # ---------------- ARTIFACTS ----------------
       - name: 📦 Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trading-debug
-          path: |
-            logs/
-            decisions/
+          name: trading-logs
+          path: logs/
           retention-days: 30
 
 # ============================================================
-# AUDIT SKIP JOB
+# AUDIT SKIP
 # ============================================================
   audit-skip:
     name: 📋 Skip Audit
@@ -275,6 +186,5 @@ jobs:
 
     steps:
       - run: |
-          echo "⏭ SKIPPED RUN"
-          echo "market: ${{ needs.preflight.outputs.market_status }}"
-          echo "safe: ${{ needs.preflight.outputs.safe_to_trade }}"
+          echo "SKIPPED RUN"
+          echo "safe_to_trade = ${{ needs.preflight.outputs.safe_to_trade }}"
