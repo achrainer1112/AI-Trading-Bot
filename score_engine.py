@@ -22,7 +22,7 @@ Schwellenwerte:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 import math
 
 from logger import log
@@ -487,6 +487,222 @@ def rank_candidates(
     ]
     candidates.sort(key=lambda x: x.total_score, reverse=True)
     return candidates[:top_k]
+
+
+class PortfolioOptimizer:
+    """
+    Portfolio-level optimizer: takes individual scores and constructs
+    a diversified target allocation across all assets.
+
+    Philosophy:
+      - Think in terms of PORTFOLIO CONSTRUCTION, not single-stock signals.
+      - Rank assets by risk-adjusted score (score / volatility).
+      - Respect sector diversification limits.
+      - Spread capital across 3-8 positions.
+      - Never concentrate >20% in one asset, maintain >10% cash reserve.
+      - Use correlation awareness to avoid stacking similar ETFs/stocks.
+    """
+
+    MAX_POSITION_PCT   = 0.20
+    MIN_CASH_PCT       = 0.10
+    MAX_SECTOR_PCT     = 0.45
+    TARGET_MIN_POS     = 3
+    TARGET_MAX_POS     = 8
+    MIN_SCORE_FOR_BUY  = SCORE_BUY  # 60
+
+    def __init__(
+        self,
+        sector_map: Dict[str, str] = None,
+        correlation_groups: List[List[str]] = None,
+        risk_settings: Dict = None,
+    ):
+        self.sector_map = sector_map or {}
+        self.correlation_groups = correlation_groups or []
+        if risk_settings:
+            self.MAX_POSITION_PCT  = risk_settings.get("max_position_pct",  self.MAX_POSITION_PCT)
+            self.MIN_CASH_PCT      = risk_settings.get("min_cash_pct",      self.MIN_CASH_PCT)
+            self.MAX_SECTOR_PCT    = risk_settings.get("max_sector_exposure",self.MAX_SECTOR_PCT)
+            self.MIN_SCORE_FOR_BUY = risk_settings.get("min_buy_score",     self.MIN_SCORE_FOR_BUY)
+
+    def optimize(
+        self,
+        scores: Dict[str, "ScoreBreakdown"],
+        current_positions: Dict[str, Dict] = None,
+        total_value: float = 100_000.0,
+    ) -> "PortfolioAllocation":
+        """
+        Build an optimal target portfolio allocation.
+
+        Returns a PortfolioAllocation with:
+          - target_allocations: {ticker: float}  (0.0–MAX_POSITION_PCT)
+          - recommended_sells: list of tickers to exit
+          - cash_target: float  (remaining cash fraction)
+          - rationale: dict of per-ticker reasoning
+        """
+        current_positions = current_positions or {}
+
+        # 1. Compute risk-adjusted score = score / (volatility + epsilon)
+        scored = []
+        for ticker, sb in scores.items():
+            vol = sb.volatility_annual or 20.0
+            risk_adj = sb.total_score / (vol + 1e-6) * 10.0  # scale for readability
+            scored.append((ticker, sb, risk_adj))
+
+        # 2. Sort by risk-adjusted score descending
+        scored.sort(key=lambda x: x[2], reverse=True)
+
+        # 3. Select buy candidates: score >= threshold
+        buy_candidates = [
+            (t, sb, ra) for t, sb, ra in scored
+            if sb.total_score >= self.MIN_SCORE_FOR_BUY
+        ]
+
+        # 4. Apply correlation filtering: keep best from each correlated group
+        buy_candidates = self._filter_correlated(buy_candidates)
+
+        # 5. Apply sector cap: prune excess concentration
+        buy_candidates = self._filter_sector_cap(buy_candidates)
+
+        # 6. Limit to TARGET_MAX_POS
+        buy_candidates = buy_candidates[:self.TARGET_MAX_POS]
+
+        # 7. Compute target allocations using score-weighted sizing
+        target_allocations: Dict[str, float] = {}
+        rationale: Dict[str, str] = {}
+        investable_budget = 1.0 - self.MIN_CASH_PCT  # e.g. 0.90
+
+        if buy_candidates:
+            total_ra = sum(ra for _, _, ra in buy_candidates)
+            for ticker, sb, ra in buy_candidates:
+                raw_alloc = (ra / total_ra) * investable_budget if total_ra > 0 else investable_budget / len(buy_candidates)
+                # Cap per-position
+                alloc = min(raw_alloc, self.MAX_POSITION_PCT)
+                target_allocations[ticker] = round(alloc, 4)
+                vol_str = f"{sb.volatility_annual:.0f}%" if sb.volatility_annual else "n/a"
+                rationale[ticker] = (
+                    f"Score={sb.total_score:.0f} | RiskAdj={ra:.1f} | "
+                    f"Sector={self.sector_map.get(ticker, 'other')} | Vola={vol_str} | "
+                    f"Alloc={alloc:.1%}"
+                )
+
+        # Normalize if total exceeds investable budget
+        total_alloc = sum(target_allocations.values())
+        if total_alloc > investable_budget:
+            scale = investable_budget / total_alloc
+            target_allocations = {t: round(a * scale, 4) for t, a in target_allocations.items()}
+
+        # 8. Identify sells: current positions not in buy list and score < HOLD
+        recommended_sells = []
+        for ticker, pos in current_positions.items():
+            if pos.get("market_value", 0) <= 0:
+                continue
+            sb = scores.get(ticker)
+            if sb and sb.total_score < SCORE_HOLD:
+                recommended_sells.append(ticker)
+            elif ticker not in target_allocations and (sb is None or sb.total_score < self.MIN_SCORE_FOR_BUY):
+                recommended_sells.append(ticker)
+
+        cash_target = round(1.0 - sum(target_allocations.values()), 4)
+
+        return PortfolioAllocation(
+            target_allocations=target_allocations,
+            recommended_sells=recommended_sells,
+            cash_target=max(cash_target, self.MIN_CASH_PCT),
+            rationale=rationale,
+        )
+
+    def _filter_correlated(self, candidates: List) -> List:
+        """Keep only the highest-scoring asset from each correlated group."""
+        selected = []
+        blocked: set = set()
+        for ticker, sb, ra in candidates:
+            if ticker in blocked:
+                continue
+            selected.append((ticker, sb, ra))
+            # Block lower-scoring members of same correlation group
+            for group in self.correlation_groups:
+                if ticker in group:
+                    for peer in group:
+                        if peer != ticker and peer not in blocked:
+                            # Only block if current ticker significantly outperforms
+                            peer_ra = next((r for t, _, r in candidates if t == peer), None)
+                            if peer_ra is not None and ra > peer_ra * 1.05:
+                                blocked.add(peer)
+        return selected
+
+    def _filter_sector_cap(self, candidates: List) -> List:
+        """Prune candidates that would push sector above MAX_SECTOR_PCT."""
+        sector_alloc: Dict[str, float] = {}
+        result = []
+        investable = 1.0 - self.MIN_CASH_PCT
+        n = len(candidates)
+        if n == 0:
+            return result
+        avg_alloc = min(investable / n, self.MAX_POSITION_PCT)
+
+        for ticker, sb, ra in candidates:
+            sector = self.sector_map.get(ticker, "other")
+            current_sector_alloc = sector_alloc.get(sector, 0.0)
+            if current_sector_alloc + avg_alloc > self.MAX_SECTOR_PCT + 0.01:
+                continue  # would exceed sector cap – skip
+            sector_alloc[sector] = current_sector_alloc + avg_alloc
+            result.append((ticker, sb, ra))
+        return result
+
+    def build_prompt_section(
+        self,
+        scores: Dict[str, "ScoreBreakdown"],
+        allocation: "PortfolioAllocation",
+    ) -> str:
+        """Build the portfolio-optimizer section for the LLM prompt."""
+        lines = ["=== PORTFOLIO OPTIMIZER (Score-Weighted Risk-Adjusted Allocation) ==="]
+        lines.append(f"Target positions: {len(allocation.target_allocations)} | Cash reserve: {allocation.cash_target:.1%}")
+        lines.append("")
+        lines.append(f"{'Ticker':<8} {'TargetAlloc':>11} {'Score':>7} {'RiskAdj':>9} {'Sector':<14} {'Rationale'}")
+        lines.append("-" * 90)
+
+        # BUY (target > 0)
+        for ticker, alloc in sorted(allocation.target_allocations.items(), key=lambda x: -x[1]):
+            sb = scores.get(ticker)
+            score_str = f"{sb.total_score:.0f}" if sb else "n/a"
+            rat = allocation.rationale.get(ticker, "")
+            ra_str = ""
+            for part in rat.split("|"):
+                if "RiskAdj" in part:
+                    ra_str = part.strip()
+            sector = self.sector_map.get(ticker, "other")
+            lines.append(f"{ticker:<8} {alloc:>10.1%}   {score_str:>7}   {ra_str:>9}   {sector:<14} →BUY")
+
+        # SELLS
+        for ticker in allocation.recommended_sells:
+            sb = scores.get(ticker)
+            score_str = f"{sb.total_score:.0f}" if sb else "n/a"
+            lines.append(f"{ticker:<8} {'0%':>10}   {score_str:>7}   {'':>9}   {self.sector_map.get(ticker,'other'):<14} →SELL")
+
+        lines.append("")
+        lines.append(
+            "PORTFOLIO CONSTRUCTION RULE: The LLM must allocate capital across the portfolio "
+            "above — not pick isolated winners. Validate sector balance and correlation. "
+            "Only deviate from suggested allocations if macro/news data provides strong justification."
+        )
+        return "\n".join(lines)
+
+
+@dataclass
+class PortfolioAllocation:
+    """Output of PortfolioOptimizer.optimize()."""
+    target_allocations: Dict[str, float]   # ticker → target fraction of portfolio
+    recommended_sells: List[str]
+    cash_target: float
+    rationale: Dict[str, str]
+
+    def summary(self) -> str:
+        lines = [f"Portfolio Allocation ({len(self.target_allocations)} positions, cash={self.cash_target:.1%}):"]
+        for t, a in sorted(self.target_allocations.items(), key=lambda x: -x[1]):
+            lines.append(f"  BUY  {t}: {a:.1%}  — {self.rationale.get(t,'')}")
+        for t in self.recommended_sells:
+            lines.append(f"  SELL {t}")
+        return "\n".join(lines)
 
 
 def build_score_prompt_section(scores: Dict[str, ScoreBreakdown]) -> str:
