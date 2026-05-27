@@ -202,6 +202,7 @@ jobs:
           TRADING_MODE: live
           PYTHONUNBUFFERED: "1"
         run: |
+          set -o pipefail
           echo "START TRADE"
           date -u
 
