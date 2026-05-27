@@ -46,7 +46,11 @@ from config import (
     LLM_SCORE_OVERRIDE_LIMIT, SCORE_TOP_K_CANDIDATES,
 )
 from utils import ensure_decision_ids
-from score_engine import ScoreEngine, ScoreBreakdown, build_score_prompt_section, rank_candidates, SCORE_BUY
+from score_engine import (
+    ScoreEngine, ScoreBreakdown, build_score_prompt_section,
+    rank_candidates, SCORE_BUY,
+    PortfolioOptimizer, PortfolioAllocation,
+)
 
 try:
     from openai import OpenAI
@@ -55,22 +59,29 @@ except ImportError:
     raise
 
 
-SYSTEM_PROMPT = """Du bist ein quantitativer Portfolio-Manager. Du erhältst deterministische Metriken und Scores für alle Assets.
+SYSTEM_PROMPT = """Du bist ein quantitativer Portfolio-Manager. Deine Aufgabe ist PORTFOLIO-KONSTRUKTION – nicht das Picks einzelner Aktien.
 
-DEINE ROLLE: Interpretation-Layer (NICHT Score-Adjustment)
-  - Die quantitativen Scores sind bereits berechnet (deterministisch) und FINAL
-  - DEIN JOB: Erklären, WARUM diese Scores aktuell sind
-  - DARF NICHT: Scores adjustieren (llm_score_adj muss IMMER 0 sein)
-  - DARF NICHT: Irrationale Entscheidungen erzeugen (z.B. Score=20 als STRONG_BUY)
-  - Narrative Begründungen sind optional, Metrik-Felder sind PFLICHT
+DEINE ROLLE: Portfolio-Optimierung auf Basis deterministischer Scores
+  - Die quantitativen Scores sind bereits berechnet (FINAL, nicht anpassbar)
+  - llm_score_adj muss IMMER 0 sein
+  - DEIN JOB: Baue das optimale Gesamt-Portfolio – denke in Allokationen, nicht in Einzelentscheidungen
 
-ENTSCHEIDUNGSREGELN (Score-based, NO LLM adjustment):
-  - BUY: quant_score >= 60 (Minimum)
-  - SELL: quant_score < 45
-  - HOLD: alles dazwischen
+PORTFOLIO-KONSTRUKTIONSPRINZIPIEN:
+  1. Bewerte ALLE Assets relativ zueinander (nicht isoliert)
+  2. Rangiere nach risikoadjustiertem Return (Score / Volatilität)
+  3. Baue ein diversifiziertes Portfolio mit 3–8 Positionen
+  4. Keine Überkonzentration in einem Asset oder Sektor
+  5. Verteile Kapital breit, wenn mehrere Assets gutes Risk/Reward bieten
+  6. Nutze Korrelationsbewusstsein (keine doppelten Tech-ETFs gleichzeitig)
+  7. Weise BUY nur zu, wenn Asset im Top-Tier des Opportunity-Sets liegt
+
+REGELN:
+  - Max. Positionsgröße: 20%
+  - Min. Cash-Reserve: 10%
+  - Sektordiversifikation (max. 45% pro Sektor)
+  - BUY: quant_score >= 60, SELL: quant_score < 45, sonst HOLD
   - Keine extremen Umschichtungen ohne klare Datenbasis
-  - Sektordiversifikation beachten (nicht zu viel Tech)
-  - Antwort NUR als JSON-Objekt, kein erklärender Text
+  - Antwort NUR als JSON-Objekt
 
 JSON-FORMAT (PFLICHT):
 {
@@ -89,13 +100,15 @@ JSON-FORMAT (PFLICHT):
         "sma_distance_pct": 5.2,
         "volatility": 28.1,
         "regime": "BULL",
-        "current_alloc": 0.08
+        "current_alloc": 0.08,
+        "portfolio_role": "Momentum leader, diversifies tech exposure"
       },
-      "reason": "Strong momentum, RS > 1.3, confirmed by score"
+      "reason": "Top risk-adjusted score; anchors tech allocation at 12%"
     }
   ],
+  "portfolio_rationale": "1-2 sentences: why THIS portfolio mix makes sense as a whole",
   "market_outlook": "Brief market outlook (1-2 sentences)",
-  "risk_assessment": "Brief risk assessment",
+  "risk_assessment": "Portfolio-level risk commentary",
   "feedback_learnings": "What you learned from past decisions"
 }"""
 
@@ -110,6 +123,13 @@ class AIAnalyzer:
         self.model = OPENAI_MODEL
         self.client = None
         self.risk_settings = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
+
+        # Portfolio-level optimizer (score-weighted, diversified allocation)
+        self.portfolio_optimizer = PortfolioOptimizer(
+            sector_map=SECTOR_CLASSIFICATION,
+            correlation_groups=CORRELATION_GROUPS,
+            risk_settings=self.risk_settings,
+        )
 
         if self.api_key:
             self.client = OpenAI(api_key=self.api_key)
@@ -176,6 +196,7 @@ class AIAnalyzer:
         scores: Dict[str, ScoreBreakdown],
         journal_entries: List[Dict] = None,
         regime_state=None,
+        portfolio_allocation=None,  # PortfolioAllocation from PortfolioOptimizer
     ) -> str:
         prompt_parts = []
 
@@ -265,7 +286,13 @@ class AIAnalyzer:
                 f"(Konfidenz: {getattr(regime_state, 'confidence', 0):.0%})"
             )
 
-        # 5. Top Candidates summary (for LLM to focus on)
+        # 5. Portfolio Optimizer Output (core portfolio-construction context)
+        if portfolio_allocation is not None:
+            prompt_parts.append(
+                "\n" + self.portfolio_optimizer.build_prompt_section(scores, portfolio_allocation)
+            )
+
+        # 5b. Top Candidates summary (for LLM to focus on)
         candidates = rank_candidates(scores, min_score=self.risk_settings.get("min_buy_score", 60), top_k=SCORE_TOP_K_CANDIDATES)
         if candidates:
             prompt_parts.append("\n=== TOP BUY-KANDIDATEN (nach quantitativem Score) ===")
@@ -280,11 +307,13 @@ class AIAnalyzer:
         tickers_str = ", ".join(watchlist[:15])
         prompt_parts.append("\n=== AUFGABE ===")
         prompt_parts.append(
-            f"Erstelle Entscheidungen für diese Ticker: {tickers_str}\n"
-            f"Verwende die quantitativen Scores als FINAL DECISION BASIS (KEINE Adjustments). "
-            f"Deine Aufgabe: Erkläre, WARUM diese Scores aktuell sind. "
-            f"Fülle das 'reasoning' Feld mit echten Metrikwerten aus den Scores. "
-            f"Antworte NUR mit JSON."
+            f"Erstelle ein PORTFOLIO-KONSTRUKTIONS-ERGEBNIS für diese Ticker: {tickers_str}\n"
+            f"WICHTIG: Denke auf PORTFOLIO-EBENE, nicht in Einzelentscheidungen.\n"
+            f"  1. Nutze den Portfolio Optimizer oben als Ausgangspunkt.\n"
+            f"  2. Validiere Sektordiversifikation und Korrelationen.\n"
+            f"  3. Weise target_allocation für jedes Asset so zu, dass das GESAMTPORTFOLIO optimiert wird.\n"
+            f"  4. Begründe im 'portfolio_rationale' warum DIESES Portfolio-MIX Sinn ergibt.\n"
+            f"  5. Scores sind FINAL (keine Adjustments). Antworte NUR mit JSON."
         )
 
         return "\n".join(prompt_parts)
@@ -315,13 +344,25 @@ class AIAnalyzer:
         for s in top:
             log.debug(f"  {s.ticker}: {s.total_score:.0f} ({s.signal}) | RSI={s.rsi} Mom={s.momentum_20d}")
 
+        # 2. Portfolio-level optimization (score-weighted, diversified)
+        portfolio_allocation = self.portfolio_optimizer.optimize(
+            scores=scores,
+            current_positions=positions,
+            total_value=total_value,
+        )
+        log.info(
+            f"PortfolioOptimizer: {len(portfolio_allocation.target_allocations)} BUY targets | "
+            f"{len(portfolio_allocation.recommended_sells)} sells | cash={portfolio_allocation.cash_target:.1%}"
+        )
+
         if not self.client:
             log.warning("Kein OpenAI Client – nutze Score-basierte Fallback-Analyse.")
-            return self._score_based_fallback(scores, market_data, portfolio_summary, watchlist)
+            return self._score_based_fallback(scores, market_data, portfolio_summary, watchlist, portfolio_allocation)
 
         prompt = self.build_prompt(
             portfolio_summary, market_data, news_text, watchlist, scores,
             journal_entries, regime_state=regime_state,
+            portfolio_allocation=portfolio_allocation,
         )
 
         log.info(f"Sende Anfrage an OpenAI ({self.model})...")
@@ -450,6 +491,7 @@ class AIAnalyzer:
             data["market_outlook"] = str(data.get("market_outlook", "No outlook"))[:500]
             data["risk_assessment"] = str(data.get("risk_assessment", ""))[:500]
             data["feedback_learnings"] = str(data.get("feedback_learnings", ""))[:300]
+            data["portfolio_rationale"] = str(data.get("portfolio_rationale", ""))[:500]
             return data
 
         except json.JSONDecodeError as e:
@@ -462,50 +504,60 @@ class AIAnalyzer:
         market_data: Dict[str, Dict],
         portfolio_summary: Dict,
         watchlist: List[str],
+        portfolio_allocation=None,  # PortfolioAllocation, pre-computed if available
     ) -> Dict:
         """
-        Rein score-basierter Fallback ohne LLM.
-        Deterministisch – keine Zufallselemente.
+        Portfolio-aware fallback ohne LLM.
+        Verwendet PortfolioOptimizer-Allokation als Grundlage (deterministisch).
         """
-        log.info("Score-basierter Fallback: verwendet quantitative Scores direkt")
+        log.info("Score-basierter Fallback: nutzt PortfolioOptimizer-Allokation direkt")
+        positions = portfolio_summary.get("positions", {})
+        total_value = portfolio_summary.get("total_value", 100_000)
+
+        # Compute optimizer allocation if not provided
+        if portfolio_allocation is None:
+            portfolio_allocation = self.portfolio_optimizer.optimize(
+                scores=scores,
+                current_positions=positions,
+                total_value=total_value,
+            )
+
         decisions = []
-        min_buy_score = self.risk_settings.get("min_buy_score", 60)
 
         for ticker in watchlist:
             sb = scores.get(ticker)
             if not sb:
                 continue
 
-            action = sb.recommended_action
-            score = sb.total_score
-
-            # Allocations basieren auf Score-Stärke
-            if action == "BUY":
-                if score >= 80:
-                    target_alloc = 0.12
-                elif score >= 70:
-                    target_alloc = 0.09
-                else:
-                    target_alloc = 0.06
-            elif action == "SELL":
+            target_alloc = portfolio_allocation.target_allocations.get(ticker)
+            if target_alloc is not None:
+                # In the optimizer's buy list
+                action = "BUY"
+                reason = f"Portfolio-optimized: {portfolio_allocation.rationale.get(ticker, '')}"
+            elif ticker in portfolio_allocation.recommended_sells:
+                action = "SELL"
                 target_alloc = 0.0
+                reason = f"Score below hold threshold ({sb.total_score:.0f})"
             else:
-                target_alloc = scores[ticker].current_alloc  # HOLD = maintain
+                action = "HOLD"
+                target_alloc = sb.current_alloc
+                reason = f"Score-based HOLD ({sb.total_score:.0f})"
 
             decisions.append({
                 "ticker": ticker,
                 "action": action,
                 "target_allocation": target_alloc,
                 "confidence": sb.confidence,
-                "quant_score": score,
+                "quant_score": sb.total_score,
                 "llm_score_adj": 0,
                 "reasoning": self._build_reasoning_from_score(sb),
-                "reason": f"Score-based: {sb.signal} ({score:.0f}pts)",
+                "reason": reason,
             })
 
         return {
             "decisions": decisions,
-            "market_outlook": "Fallback: score-based analysis (no LLM).",
-            "risk_assessment": "Using quantitative scores only.",
+            "portfolio_rationale": portfolio_allocation.summary(),
+            "market_outlook": "Fallback: portfolio-optimized score-based analysis (no LLM).",
+            "risk_assessment": "Using PortfolioOptimizer allocation (risk-adjusted, diversified).",
             "scores": {t: sb.to_dict() for t, sb in scores.items()},
         }
