@@ -71,7 +71,7 @@ class PortfolioManager:
         self.cash: float = initial_capital
         self.read_only = (self.mode == "DRY")
 
-        if self.mode in ("PAPER", "REAL") and self.alpaca_api:
+        if self.mode in ("PAPER", "REAL", "LIVE") and self.alpaca_api:
             try:
                 self._load_from_alpaca()
             except Exception as e:
@@ -183,7 +183,7 @@ class PortfolioManager:
           3. BUY-Orders ausfuehren
         Gibt True zurueck wenn Sync erfolgreich.
         """
-        if not self.alpaca_api or self.mode not in ("PAPER", "REAL"):
+        if not self.alpaca_api or self.mode not in ("PAPER", "REAL", "LIVE"):
             log.debug("Broker-Sync nicht noetig (DRY Modus).")
             return False
         try:
