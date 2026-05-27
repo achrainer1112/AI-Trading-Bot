@@ -186,6 +186,7 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ALLOW_LIVE_TRADING: ${{ secrets.ALLOW_LIVE_TRADING }}
+          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
           TRADING_MODE: live
           PYTHONUNBUFFERED: "1"
         run: |
