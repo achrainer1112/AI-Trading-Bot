@@ -1,69 +1,64 @@
 """
 cpo_engine.py – Continuous Portfolio Optimizer (CPO)
 ======================================================
-Zentrales Portfolio-Optimierungsmodul, das keine Einzeltrades generiert,
-sondern ein optimiertes Zielportfolio + aggregierte Trade-Intents.
-
-Ausgabe:
-- target_weights (pro Asset)
-- buy_cluster / sell_cluster (optional nach Sektor gruppiert)
-- cash_target
-- risk_summary
+Regime-aware, volatilitätsadjustiertes Position Sizing mit Momentum-Boosting
+und Korrelations-Cluster Exposure Control.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import math
 
 from logger import log
-from config import ACTIVE_RISK_PROFILE, RISK_SETTINGS, SECTOR_CLASSIFICATION
+from config import (
+    ACTIVE_RISK_PROFILE, RISK_SETTINGS, SECTOR_CLASSIFICATION,
+    VOLATILITY_MULTIPLIERS, MOMENTUM_BOOST_ENABLED, MOMENTUM_BOOST_FACTOR,
+    MOMENTUM_STRENGTH_THRESHOLD, CORRELATION_CLUSTERS, MAX_CLUSTER_EXPOSURE,
+    CASH_TARGET_BY_REGIME,
+)
 
 
 @dataclass
 class AssetData:
     ticker: str
-    score: float          # 0-100
-    confidence: float     # 0-1
-    volatility: float     # annualisiert (%)
-    momentum: float       # 20d return (%)
+    score: float
+    confidence: float
+    volatility: float
+    momentum: float
     current_weight: float
     sector: str
     is_core: bool = False
 
 
 class ContinuousPortfolioOptimizer:
-    """
-    Portfolio-Optimierer nach CPO-Prinzipien.
-    """
-
     def __init__(self, risk_profile=None):
         self.risk_profile = risk_profile or ACTIVE_RISK_PROFILE
         self.settings = RISK_SETTINGS[self.risk_profile].copy()
         self.max_position_pct = self.settings.get("max_position_pct", 0.20)
         self.core_tickers = {"SPY", "VT", "QQQ", "IVV", "VOO", "VTI"}
+        self.regime_multiplier = {"BULL": 1.2, "SIDEWAYS": 1.0, "BEAR": 0.7}
+        self.cash_target_by_regime = CASH_TARGET_BY_REGIME
 
-        # Cash-Ziele je Regime (als Bereich, wir nehmen Mittelwert)
-        self.cash_target_by_regime = {
-            "BULL": 0.10,       # 5-15%
-            "SIDEWAYS": 0.15,   # 10-25%
-            "BEAR": 0.30,       # 20-40%
-        }
+    def _get_volatility_multiplier(self, vol: float) -> float:
+        for level, cfg in VOLATILITY_MULTIPLIERS.items():
+            if vol <= cfg["max_vol"]:
+                return cfg["multiplier"]
+        return 0.4
 
-        # Regime-Multiplier für Risikobereitschaft
-        self.regime_multiplier = {
-            "BULL": 1.2,
-            "SIDEWAYS": 1.0,
-            "BEAR": 0.7,
-        }
-
-        # Sektor-Cluster für Aggregation (optional)
-        self.sector_clusters = {
-            "tech": ["QQQ", "XLK", "AAPL", "MSFT", "NVDA", "AMD"],
-            "financial": ["XLF", "JPM", "V", "MA"],
-            "healthcare": ["XLV"],
-            "energy": ["XLE"],
-            "defensive": ["SPY", "VT"],
-        }
+    def _apply_cluster_caps(self, target_weights: Dict[str, float]) -> Dict[str, float]:
+        """Reduziert Exposure in Korrelations-Clustern, die das Limit überschreiten."""
+        result = target_weights.copy()
+        for cluster in CORRELATION_CLUSTERS:
+            name = cluster["name"]
+            tickers = cluster["tickers"]
+            exposure = sum(result.get(t, 0.0) for t in tickers)
+            max_exp = MAX_CLUSTER_EXPOSURE.get(name, 0.40)
+            if exposure > max_exp:
+                scale = max_exp / exposure
+                for t in tickers:
+                    if t in result:
+                        result[t] *= scale
+        return result
 
     def compute_target_weights(
         self,
@@ -71,49 +66,45 @@ class ContinuousPortfolioOptimizer:
         regime: str,
         portfolio_value: float,
     ) -> Dict[str, float]:
-        """
-        Berechnet Zielgewichte basierend auf:
-        - Base Score
-        - Confidence Multiplier (linear: confidence/100)
-        - Regime Multiplier
-        - Volatility Penalty (1 / (1 + vol/100))
-        - Portfolio Smoothing (log)
-        """
-        # Roh-Scores
+        investable = 1.0 - self.cash_target_by_regime.get(regime, 0.10)
         raw = {}
+
         for ticker, a in assets.items():
-            # Base Score
             base = a.score / 100.0
-            # Confidence Multiplier (direkt proportional)
             conf_mult = a.confidence
-            # Regime Multiplier (für alle Assets gleich)
             regime_mult = self.regime_multiplier.get(regime, 1.0)
-            # Volatility Penalty (höhere Vola -> niedrigeres Gewicht)
-            vol_penalty = 1.0 / (1.0 + a.volatility / 100.0)
-            # Core Bonus (geringer Bonus für Core Holdings)
+            vol_mult = self._get_volatility_multiplier(a.volatility)
+
+            # Momentum-Boosting nur im Bullenmarkt
+            momentum_boost = 1.0
+            if regime == "BULL" and MOMENTUM_BOOST_ENABLED and a.momentum > MOMENTUM_STRENGTH_THRESHOLD:
+                boost = 1.0 + (a.momentum / 100.0) * 0.5
+                momentum_boost = min(MOMENTUM_BOOST_FACTOR, boost)
+
             core_bonus = 1.05 if a.is_core else 1.0
 
-            weighted_score = base * conf_mult * regime_mult * vol_penalty * core_bonus
-            raw[ticker] = max(0.01, weighted_score)
+            weighted = base * conf_mult * regime_mult * vol_mult * momentum_boost * core_bonus
+            raw[ticker] = max(0.01, weighted)
 
-        # Normalisierung auf investierbares Kapital
         total_raw = sum(raw.values())
         if total_raw == 0:
             return {t: 0.0 for t in assets}
 
-        investable = 1.0 - self.cash_target_by_regime.get(regime, 0.10)
         target = {t: (w / total_raw) * investable for t, w in raw.items()}
 
-        # Cap pro Position
+        # Einzelne Positionscaps
         for t in target:
             target[t] = min(target[t], self.max_position_pct)
 
-        # Smoothing: Verhindere extreme Ausreißer (optional)
+        # Cluster-Caps
+        target = self._apply_cluster_caps(target)
+
+        # Glättung mit aktuellen Gewichten (verhindert Overfitting)
         for t in target:
             current = assets[t].current_weight
-            target[t] = 0.7 * target[t] + 0.3 * current  # Glättung
+            target[t] = 0.7 * target[t] + 0.3 * current
 
-        # Zweite Normalisierung nach Smoothing
+        # Zweite Normalisierung
         total_target = sum(target.values())
         if total_target > investable:
             scale = investable / total_target
@@ -121,28 +112,13 @@ class ContinuousPortfolioOptimizer:
 
         return target
 
-    def determine_clusters(
-        self,
-        trades: List[Dict],
-    ) -> Dict[str, List[str]]:
-        """
-        Gruppiert Trades in Cluster (z. B. TECH_CLUSTER, DEFENSIVE_CLUSTER).
-        """
-        if not trades:
-            return {}
-
-        # Mapping Ticker -> Sektor (aus config)
-        sector_of = SECTOR_CLASSIFICATION
+    def determine_clusters(self, tickers: List[str]) -> Dict[str, List[str]]:
+        """Gruppiert Ticker in Sektor-Cluster (für Output)."""
         clusters = {}
-
-        for t in trades:
-            ticker = t["ticker"]
-            sector = sector_of.get(ticker, "other")
+        for t in tickers:
+            sector = SECTOR_CLASSIFICATION.get(t, "other")
             cluster_name = f"{sector.upper()}_CLUSTER"
-            if cluster_name not in clusters:
-                clusters[cluster_name] = []
-            clusters[cluster_name].append(ticker)
-
+            clusters.setdefault(cluster_name, []).append(t)
         return clusters
 
     def optimize(
@@ -156,11 +132,10 @@ class ContinuousPortfolioOptimizer:
         portfolio_value: float,
     ) -> Tuple[Dict[str, float], float, Dict[str, List[str]], Dict[str, List[str]], str]:
         """
-        Hauptmethode.
         Returns:
             target_weights, cash_target, buy_cluster, sell_cluster, rationale
         """
-        # 1. AssetData-Objekte erstellen
+        # AssetData-Objekte erstellen
         assets = {}
         all_tickers = set(scores.keys()) | set(current_weights.keys())
         for ticker in all_tickers:
@@ -174,32 +149,28 @@ class ContinuousPortfolioOptimizer:
             assets[ticker] = AssetData(
                 ticker=ticker, score=score, confidence=conf,
                 volatility=vol, momentum=mom, current_weight=current,
-                sector=sector, is_core=is_core,
+                sector=sector, is_core=is_core
             )
 
-        # 2. Zielgewichte berechnen
         target_weights = self.compute_target_weights(assets, regime, portfolio_value)
-
-        # 3. Cash-Ziel
         cash_target = max(self.cash_target_by_regime.get(regime, 0.10), 1.0 - sum(target_weights.values()))
 
-        # 4. Trade-Intents (Differenzen)
+        # Trade-Intents ableiten
         buy_tickers = []
         sell_tickers = []
-        for ticker, target in target_weights.items():
-            current = current_weights.get(ticker, 0.0)
-            if target > current + 0.01:   # >1% Aufstockung
-                buy_tickers.append(ticker)
-            elif target < current - 0.01: # >1% Reduktion
-                sell_tickers.append(ticker)
+        for t, target in target_weights.items():
+            current = current_weights.get(t, 0.0)
+            if target > current + 0.01:
+                buy_tickers.append(t)
+            elif target < current - 0.01:
+                sell_tickers.append(t)
 
-        # 5. Cluster bilden (optional)
-        buy_cluster = self.determine_clusters([{"ticker": t} for t in buy_tickers])
-        sell_cluster = self.determine_clusters([{"ticker": t} for t in sell_tickers])
+        buy_cluster = self.determine_clusters(buy_tickers)
+        sell_cluster = self.determine_clusters(sell_tickers)
 
-        # 6. Rationale
-        rationale = f"CPO: Regime {regime}, Cash-Ziel {cash_target:.1%}, "
-        rationale += f"{len(buy_tickers)} Buy-Intents, {len(sell_tickers)} Sell-Intents"
+        rationale = f"CPO: Regime {regime}, Cash-Ziel {cash_target:.1%}, " \
+                    f"{len(buy_tickers)} Buy-Intents, {len(sell_tickers)} Sell-Intents"
 
-        log.info(f"CPO: Target weights for {len(target_weights)} assets, Cash {cash_target:.1%}")
+        log.info(f"CPO: {len(target_weights)} Assets, Cash {cash_target:.1%}, "
+                 f"Boosts: {MOMENTUM_BOOST_ENABLED and regime=='BULL'}")
         return target_weights, cash_target, buy_cluster, sell_cluster, rationale
