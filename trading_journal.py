@@ -4,13 +4,17 @@ AI Trading Bot - Trading Journal
 Transparentes Protokoll aller KI-Entscheidungen und Trades.
 Speichert WARUM jede Entscheidung getroffen wurde.
 
-Gespeichert in: logs/journal.json
+Erweitert um:
+- Adaptive Confidence Thresholds Logging
+- Regime-basierte Performance
+- Score Breakdown (strukturiert)
+- Decision Trace
 """
 
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from pathlib import Path
 
 from logger import log
@@ -22,14 +26,8 @@ from utils import (
     calculate_volatility,
     calculate_beta_alpha,
     calculate_profit_factor,
+    format_currency,
 )
-
-# Robust import of format_currency – never crash the journal on a missing utility
-try:
-    from utils import format_currency
-except ImportError:
-    def format_currency(x: float) -> str:  # type: ignore[misc]
-        return f"${x:,.2f}"
 
 JOURNAL_FILE = "logs/journal.json"
 
@@ -41,6 +39,8 @@ class TradingJournal:
     - Jede Entscheidung mit Begründung, Konfidenz, Aktion
     - Ausgeführte Trades mit Grund
     - Portfolio-Snapshot vorher/nachher
+    - Adaptive Confidence Thresholds
+    - Performance-Metriken
     """
 
     def __init__(self):
@@ -64,6 +64,7 @@ class TradingJournal:
         market_data: Dict[str, Dict] = None,
         execution_mode: str = "SIMULATED",
         market_closed: bool = False,
+        risk_manager=None,  # neu: für adaptive Thresholds
         debug: bool = False,
     ):
         """Speichert einen kompletten Trading-Run im Journal."""
@@ -81,7 +82,7 @@ class TradingJournal:
             "risk_assessment": risk_assessment,
             "feedback_learnings": feedback_learnings,
 
-            # Score Breakdown + Decision Trace (structured logging)
+            # Score Breakdown + Decision Trace
             "score_breakdown": self._build_score_breakdown(ai_signals, market_data),
             "decision_trace": self._build_decision_trace(ai_signals, final_decisions),
 
@@ -93,6 +94,9 @@ class TradingJournal:
                 "n_positions": portfolio_before.get("n_positions", 0),
                 "pnl_pct": portfolio_before.get("pnl_pct", 0),
             },
+
+            # Adaptive Confidence Thresholds (neu)
+            "adaptive_thresholds": self._build_adaptive_section(risk_manager),
 
             # Alle KI-Entscheidungen mit Begründung
             "ai_signals": [
@@ -154,23 +158,19 @@ class TradingJournal:
                 for t in simulated_trades
             ],
 
-            "risk_warnings": risk_warnings,
+            "risk_warnings": risk_warnings or [],
 
             # Ausgeführte Trades
             "executed_trades": [
                 {
                     "ticker": t.get("ticker"),
                     "action": t.get("action"),
-
-                    # FIX → echte Broker-Fills statt falscher Keys
                     "value_usd": t.get("fill_value", t.get("planned_value", 0)),
                     "quantity": t.get("fill_qty", t.get("planned_qty", 0)),
                     "price": t.get("fill_price", t.get("price", 0)),
                     "decision_id": t.get("decision_id"),
-
                     "ai_reason": t.get("reason", t.get("ai_reason", "Portfolio Rebalancing")),
                     "ai_confidence_pct": round(t.get("ai_confidence", 0) * 100, 1),
-
                     "from_alloc_pct": round(t.get("current_alloc", 0) * 100, 1),
                     "to_alloc_pct": round(t.get("target_alloc", 0) * 100, 1),
                     "status": t.get("status", "EXECUTED"),
@@ -214,10 +214,9 @@ class TradingJournal:
             "blocked_trades_count": len([d for d in final_decisions if not d.get("risk_approved", True)]),
         }
 
-        # In Journal speichern
+        # Performance-Metriken aus Historie berechnen
         journal = load_json_file(JOURNAL_FILE, default=[])
         journal.append(entry)
-        # Max 365 Einträge behalten
         if len(journal) > 365:
             journal = journal[-365:]
         metrics = self._calculate_performance_metrics(journal)
@@ -228,6 +227,38 @@ class TradingJournal:
 
         # Lesbares Summary im Log ausgeben
         self._print_journal_entry(entry)
+
+    def _build_adaptive_section(self, risk_manager) -> Dict:
+        """Extrahiert adaptive Thresholds aus RiskManager."""
+        if risk_manager is None or not hasattr(risk_manager, 'get_adaptive_log'):
+            return {}
+        adaptive = risk_manager.get_adaptive_log()
+        if not adaptive:
+            return {}
+        return {
+            "buy_threshold_pct": round(adaptive.get("buy_threshold", 0.6) * 100, 1),
+            "sell_threshold_pct": round(adaptive.get("sell_threshold", 0.6) * 100, 1),
+            "vix": adaptive.get("vix"),
+            "vix_adjustment_pct": round(adaptive.get("vix_adjustment", 0) * 100, 1),
+            "momentum": round(adaptive.get("momentum", 0), 3),
+            "cash_pct": round(adaptive.get("cash_pct", 1) * 100, 1),
+            "explanation": self._format_adaptive_explanation(adaptive),
+        }
+
+    def _format_adaptive_explanation(self, adaptive: Dict) -> str:
+        """Erzeugt eine lesbare Erklärung der adaptiven Anpassungen."""
+        parts = []
+        buy = adaptive.get("buy_threshold", 0.6) * 100
+        sell = adaptive.get("sell_threshold", 0.6) * 100
+        parts.append(f"BUY threshold: {buy:.0f}%")
+        parts.append(f"SELL threshold: {sell:.0f}%")
+        if adaptive.get("vix_adjustment", 0) != 0:
+            parts.append(f"VIX adjustment: {adaptive.get('vix_adjustment', 0)*100:.0f}%")
+        if adaptive.get("momentum", 0) != 0:
+            parts.append(f"Momentum adjustment: {adaptive.get('momentum', 0)*100:.0f}%")
+        if adaptive.get("cash_pct", 100) < 8:
+            parts.append("Cash < 8%: BUY threshold increased")
+        return " | ".join(parts)
 
     def _calculate_performance_metrics(self, history: List[Dict]) -> Dict:
         values = [entry.get("portfolio_after", {}).get("total_value") for entry in history]
@@ -280,27 +311,30 @@ class TradingJournal:
         regime = entry.get("market_regime")
         if regime:
             regime_label = regime.get("regime", "?").upper()
-            regime_conf  = regime.get("confidence", 0)
-            vix_str      = f" | VIX={regime['vix']:.1f}" if regime.get("vix") else ""
+            regime_conf = regime.get("confidence", 0)
+            vix_str = f" | VIX={regime['vix']:.1f}" if regime.get("vix") else ""
             log.info(f"Markt-Regime: {regime_label} ({regime_conf:.0%}){vix_str}")
             log.info(f"  {regime.get('description', '')}")
+
+        # Adaptive Thresholds anzeigen
+        adaptive = entry.get("adaptive_thresholds", {})
+        if adaptive:
+            log.info(f"Adaptive Confidence: BUY={adaptive.get('buy_threshold_pct', 60):.0f}% | SELL={adaptive.get('sell_threshold_pct', 60):.0f}%")
+            if adaptive.get("vix_adjustment_pct"):
+                log.info(f"  VIX adjustment: {adaptive.get('vix_adjustment_pct'):+.0f}%")
+            if adaptive.get("momentum"):
+                log.info(f"  Momentum adjustment: {adaptive.get('momentum'):+.2f}")
+            if adaptive.get("cash_pct", 100) < 8:
+                log.info(f"  Cash < 8%: BUY threshold increased")
 
         log.info("")
         log.info(f"KI MARKTAUSBLICK: {entry['market_outlook']}")
         log.info(f"RISIKOEINSCHÄTZUNG: {entry['risk_assessment']}")
         if entry.get("execution_mode"):
-            log.info(
-                f"Execution mode: {entry['execution_mode']} | "
-                f"Market closed: {entry.get('market_closed', False)}"
-            )
+            log.info(f"Execution mode: {entry['execution_mode']} | Market closed: {entry.get('market_closed', False)}")
         if entry.get("portfolio_projection"):
             proj = entry["portfolio_projection"]
-            log.info(
-                f"Projected portfolio after simulated trades: "
-                f"{format_currency(proj.get('total_value', 0))} | "
-                f"Cash: {format_currency(proj.get('cash', 0))} | "
-                f"PnL: {proj.get('pnl_pct', 0):+.2f}%"
-            )
+            log.info(f"Projected portfolio after simulated trades: {format_currency(proj.get('total_value', 0))} | Cash: {format_currency(proj.get('cash', 0))} | PnL: {proj.get('pnl_pct', 0):+.2f}%")
         if entry.get("feedback_learnings"):
             log.info(f"KI-LEARNINGS: {entry['feedback_learnings']}")
         log.info("")
@@ -309,12 +343,7 @@ class TradingJournal:
         if entry.get("ai_signals"):
             log.info("── AI SIGNALS ──")
             for d in entry["ai_signals"]:
-                log.info(
-                    f"  {d['action']:<5} {d['ticker']:<6} | "
-                    f"Ziel: {d['target_allocation_pct']:.0f}% | "
-                    f"Konfidenz: {d['confidence_pct']:.0f}% | "
-                    f"ID: {d.get('decision_id', '')}"
-                )
+                log.info(f"  {d['action']:<5} {d['ticker']:<6} | Ziel: {d['target_allocation_pct']:.0f}% | Konfidenz: {d['confidence_pct']:.0f}% | ID: {d.get('decision_id', '')}")
                 if d.get("filter_notes"):
                     for note in d["filter_notes"]:
                         log.info(f"         Note: {note}")
@@ -324,44 +353,24 @@ class TradingJournal:
         if entry.get("approved_trades"):
             log.info("\n── APPROVED TRADES ──")
             for d in entry["approved_trades"]:
-                log.info(
-                    f"  {d['action']:<5} {d['ticker']:<6} | "
-                    f"Ziel: {d['target_allocation_pct']:.0f}% | "
-                    f"Konfidenz: {d['confidence_pct']:.0f}% | "
-                    f"ID: {d.get('decision_id', '')}"
-                )
+                log.info(f"  {d['action']:<5} {d['ticker']:<6} | Ziel: {d['target_allocation_pct']:.0f}% | Konfidenz: {d['confidence_pct']:.0f}% | ID: {d.get('decision_id', '')}")
                 log.info(f"         Grund: {d['reason']}")
 
         if entry.get("blocked_trades"):
             log.info("\n── BLOCKED TRADES ──")
             for d in entry["blocked_trades"]:
-                log.info(
-                    f"  {d['action']:<5} {d['ticker']:<6} | "
-                    f"Status: {d.get('status', 'BLOCKED')} | "
-                    f"Ziel: {d['target_allocation_pct']:.0f}% | "
-                    f"Konfidenz: {d['confidence_pct']:.0f}%"
-                )
+                log.info(f"  {d['action']:<5} {d['ticker']:<6} | Status: {d.get('status', 'BLOCKED')} | Ziel: {d['target_allocation_pct']:.0f}% | Konfidenz: {d['confidence_pct']:.0f}%")
                 log.info(f"         Grund: {d['reason']}")
 
         if entry.get("simulated_trades"):
             log.info("\n── SIMULATED TRADES ──")
             for t in entry["simulated_trades"]:
-                log.info(
-                    f"  {t['action']:<5} {t['ticker']:<6} | "
-                    f"Wert: ${t['value_usd']:,.0f} | "
-                    f"ID: {t.get('decision_id', '')} | "
-                    f"Ziel: {t['to_alloc_pct']:.0f}%"
-                )
+                log.info(f"  {t['action']:<5} {t['ticker']:<6} | Wert: ${t['value_usd']:,.0f} | ID: {t.get('decision_id', '')} | Ziel: {t['to_alloc_pct']:.0f}%")
 
         if entry.get("executed_trades"):
             log.info("\n── EXECUTED TRADES ──")
             for t in entry["executed_trades"]:
-                log.info(
-                    f"  {t['action']:<5} {t['ticker']:<6} | "
-                    f"Wert: ${t['value_usd']:,.0f} | "
-                    f"Status: {t.get('status', '')} | "
-                    f"ID: {t.get('decision_id', '')}"
-                )
+                log.info(f"  {t['action']:<5} {t['ticker']:<6} | Wert: ${t['value_usd']:,.0f} | Status: {t.get('status', '')} | ID: {t.get('decision_id', '')}")
         else:
             log.info("\n── KEINE TRADES AUSGEFÜHRT ──")
 
@@ -372,18 +381,10 @@ class TradingJournal:
                 log.info(f"  ⚠ {w}")
 
         log.info("")
-        log.info(f"PORTFOLIO: ${entry['portfolio_after']['total_value']:,.2f} | "
-                 f"P&L: {entry['portfolio_after']['pnl_pct']:+.2f}% | "
-                 f"Cash: {entry['portfolio_after']['cash_pct']:.1f}%")
+        log.info(f"PORTFOLIO: ${entry['portfolio_after']['total_value']:,.2f} | P&L: {entry['portfolio_after']['pnl_pct']:+.2f}% | Cash: {entry['portfolio_after']['cash_pct']:.1f}%")
         log.info("=" * 70)
 
-    # ── Structured Logging Helpers ──────────────────────────────────────────
-
     def _build_score_breakdown(self, ai_signals: List[Dict], market_data: Dict) -> List[Dict]:
-        """
-        Extrahiert Score-Aufschlüsselung aus KI-Signalen für persistentes Logging.
-        Enthält quant_score, llm_adj, reasoning-Metriken.
-        """
         rows = []
         for d in ai_signals:
             ticker = d.get("ticker", "")
@@ -396,7 +397,6 @@ class TradingJournal:
                 "effective_score": (d.get("quant_score") or 0) + (d.get("llm_score_adj") or 0),
                 "confidence": d.get("confidence"),
                 "reasoning": d.get("reasoning", {}),
-                # Zusätzliche Marktmetriken direkt aus market_data
                 "rsi": mkt.get("rsi_14"),
                 "momentum_20d": mkt.get("return_20d"),
                 "sma_distance_pct": mkt.get("sma_distance_pct"),
@@ -406,10 +406,6 @@ class TradingJournal:
         return rows
 
     def _build_decision_trace(self, ai_signals: List[Dict], final_decisions: List[Dict]) -> List[Dict]:
-        """
-        Decision Trace: Verfolgt jede Entscheidung von AI-Signal bis zur finalen Validierung.
-        Zeigt was geblockt/modifiziert wurde und warum.
-        """
         final_map = {d.get("ticker"): d for d in final_decisions}
         trace = []
         for sig in ai_signals:
@@ -434,11 +430,9 @@ class TradingJournal:
         return trace
 
     def get_history(self) -> List[Dict]:
-        """Gibt gesamte Journal-Historie zurück."""
         return load_json_file(JOURNAL_FILE, default=[])
 
     def print_history(self, last_n: int = 5):
-        """Gibt die letzten N Journal-Einträge aus."""
         history = self.get_history()
         if not history:
             log.info("Journal ist leer – noch keine Runs.")
