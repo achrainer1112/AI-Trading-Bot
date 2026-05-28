@@ -1,8 +1,6 @@
 """
-AI Trading Bot - Hauptprogramm (Production) mit Portfolio Rebalancing Engine
-==============================================================
-Integriert die neue Portfolio Rebalancing Engine für ganzheitliche,
-transaktionskostenbewusste Portfolio-Optimierung.
+AI Trading Bot - Hauptprogramm (Production) mit Decision Weighting Engine
+=======================================================================
 """
 
 import argparse
@@ -37,6 +35,7 @@ from execution_safety import LiveRunLogger, DrawdownMonitor
 from config import ALLOW_LIVE_TRADING, KILL_SWITCH_DRAWDOWN_PCT
 from capital_rotator import CapitalRotator
 from portfolio_rebalancer import PortfolioRebalancer, RebalancingDecision
+from decision_weighter import DecisionWeighter, WeightedSignal
 
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -45,7 +44,6 @@ os.makedirs(LOG_DIR, exist_ok=True)
 class TradingBot:
     """
     Orchestriert alle Module für den vollautomatischen Trading-Ablauf.
-    Verwendet jetzt die Portfolio Rebalancing Engine als zentrale Optimierungsinstanz.
     """
 
     def __init__(self, mode: str = None):
@@ -56,6 +54,7 @@ class TradingBot:
         log.info(f"  Watchlist: {len(FULL_WATCHLIST)} Assets")
         log.info(f"  Markt-Status: {market_status()}")
         log.info(f"  Rebalancing Engine: {'AKTIV' if REBALANCING_ENGINE_ENABLED else 'INAKTIV'}")
+        log.info("  Decision Weighting Engine: AKTIV")
         log.info("=" * 70)
 
         self.data_collector = MarketDataCollector(FULL_WATCHLIST)
@@ -67,8 +66,8 @@ class TradingBot:
         self.portfolio = PortfolioManager(mode=self.mode, alpaca_api=alpaca_api)
         self.risk_manager = RiskManager(ACTIVE_RISK_PROFILE)
 
-        # Neue Portfolio Rebalancing Engine
         self.rebalancer = PortfolioRebalancer(ACTIVE_RISK_PROFILE)
+        self.decision_weighter = DecisionWeighter()
 
         self._live_logger = LiveRunLogger()
         _guard = self.executor.get_guard()
@@ -158,7 +157,7 @@ class TradingBot:
         total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
         cash = portfolio_summary_before.get("cash", 0.0)
 
-        # Portfolio Rebalancing Engine (neu)
+        # Portfolio Rebalancing Engine (CPO)
         rebalancing_decisions, target_weights, cash_target, rebalance_rationale = self.rebalancer.optimize_portfolio(
             scores=scores,
             market_data=market_data,
@@ -168,19 +167,6 @@ class TradingBot:
             regime_state=regime_state,
         )
 
-        # Konvertiere Rebalancing-Entscheidungen in das alte Decision-Format für Kompatibilität
-        rebalancing_actions = []
-        for d in rebalancing_decisions:
-            rebalancing_actions.append({
-                "ticker": d.ticker,
-                "action": d.action,
-                "target_allocation": d.target_weight,
-                "confidence": d.confidence,
-                "reason": d.reason,
-                "risk_approved": True,
-                "rebalancing_engine": True,
-            })
-
         # KI-Analyse (nutzt die Rebalancing-Vorschläge als Basis)
         ai_input_log = {"timestamp": start_time.isoformat(), "watchlist": effective_watchlist, "portfolio": portfolio_summary_before}
         save_json_file(f"{LOG_DIR}/ai_input_{start_time.strftime('%Y%m%d_%H%M%S')}.json", ai_input_log)
@@ -189,8 +175,7 @@ class TradingBot:
         if recent_journal:
             log.info(f"  Feedback-Loop: {len(recent_journal)} vergangene Runs geladen.")
 
-        # Wir übergeben die Rebalancing-Zielallokationen an die KI als "portfolio_allocation"
-        # Dazu bauen wir ein einfaches Dict (mock des PortfolioAllocation)
+        # MockAllocation für KI
         class MockAllocation:
             def __init__(self, targets, cash_t, rationale):
                 self.target_allocations = targets
@@ -208,16 +193,54 @@ class TradingBot:
             regime_state=regime_state,
             portfolio_allocation=mock_allocation,
         )
-        raw_decisions = [dict(d) for d in ai_result.get("decisions", [])]
+        raw_ai_decisions = [dict(d) for d in ai_result.get("decisions", [])]
 
-        # Mische KI-Entscheidungen mit den Rebalancing-Entscheidungen (Rebalancing hat höhere Priorität)
-        decision_map = {d["ticker"]: d for d in raw_decisions}
-        for rd in rebalancing_actions:
-            ticker = rd["ticker"]
-            if ticker in decision_map:
-                log.debug(f"Überschreibe KI-Entscheidung für {ticker} mit Rebalancing-Engine: {rd['action']}")
-            decision_map[ticker] = rd
-        merged_decisions = list(decision_map.values())
+        # ========== DECISION WEIGHTING ENGINE ==========
+        # Erstelle WeightedSignal für alle relevanten Ticker
+        weighted_signals = []
+        all_tickers = set(scores_obj.keys()) | set(self.portfolio.positions.keys()) | set(target_weights.keys())
+        high_volatility = market_data.get("vix", 15) > 35
+
+        for ticker in all_tickers:
+            quant_score = scores_obj[ticker].total_score if ticker in scores_obj else 50.0
+            # KI-Konfidenz aus AI-Entscheidungen
+            ai_conf = next((d.get("confidence", 0.5) for d in raw_ai_decisions if d["ticker"] == ticker), 0.5) * 100
+            # Risk Score: abhängig von Volatilität
+            vol = volatility.get(ticker, 20.0)
+            risk_score = max(-1.0, min(1.0, (15.0 - vol) / 50.0))
+            # CPO Score: Zielabweichung
+            current_weight = current_weights.get(ticker, 0.0)
+            target_weight = target_weights.get(ticker, current_weight)
+            cpo_score = max(-1.0, min(1.0, (target_weight - current_weight) * 5))
+            # Risk Approval wird später vom Risk Manager geprüft; hier erstmal True
+            risk_approved = True
+
+            weighted_signals.append(WeightedSignal(
+                ticker=ticker,
+                quant_score=quant_score,
+                ai_confidence=ai_conf,
+                risk_score=risk_score,
+                cpo_score=cpo_score,
+                current_weight=current_weight,
+                target_weight=target_weight,
+                risk_approved=risk_approved,
+            ))
+
+        # Fusioniere die Entscheidungen
+        weighted_decisions = self.decision_weighter.process_assets(weighted_signals, regime_state, high_volatility)
+        # Konvertiere in das erwartete Format (target_allocation, etc.)
+        merged_decisions = []
+        for wd in weighted_decisions:
+            merged_decisions.append({
+                "ticker": wd["ticker"],
+                "action": wd["action"],
+                "target_allocation": wd["target_weight"],
+                "confidence": wd["confidence"],
+                "reason": wd["reason"],
+                "decision_id": f"WEIGHTED_{wd['ticker']}",
+                "risk_approved": True,  # wird später validiert
+            })
+        # ============================================
 
         # DecisionFilter
         log.info("\nSCHRITT 4b/8: Decision quality filter...")
@@ -241,7 +264,7 @@ class TradingBot:
         decisions, cooldown_warnings = cooldown_manager.filter_decisions(decisions)
         if cooldown_warnings:
             run_summary["cooldown_warnings"] = cooldown_warnings
-        log.info(f"  {len(decisions)} Entscheidungen | {ai_result.get('market_outlook', '')[:80]}")
+        log.info(f"  {len(decisions)} Entscheidungen")
         for d in decisions:
             log.info(f"  → {d['action']:<5} {d['ticker']:<6} Allok: {d.get('target_allocation', 0):.0%} | Konfidenz: {d.get('confidence', 0):.0%}")
 
@@ -260,7 +283,7 @@ class TradingBot:
         if norm_warnings:
             run_summary["normalization_warnings"] = norm_warnings
 
-        # SCHRITT 6: Risikoprüfung & Validierung
+        # SCHRITT 6: Risikoprüfung & Validierung (mit adaptiven Thresholds)
         log.info("\nSCHRITT 6/8: Risikoprüfung & Validierung...")
         validated, risk_warnings = self.risk_manager.validate_decisions(
             decisions=normalized_decisions,
@@ -292,7 +315,7 @@ class TradingBot:
             min_trade_value=min_trade_value,
         )
 
-        # ===== CAPITAL ROTATION (optional) =====
+        # ===== CAPITAL ROTATION =====
         approved_buys = [d for d in validated if d.get("action") == "BUY" and d.get("risk_approved")]
         if approved_buys and total_value > 2000:
             rotator = CapitalRotator()
@@ -424,7 +447,6 @@ class TradingBot:
                 if spendable_cash < 1.0:
                     log.info(f"  BUY {ticker}: kein spendbares Cash – übersprungen")
                     continue
-                log.info(f"🔍 DEBUG: Executing BUY {ticker} target_value={trade.get('value')}, spendable={spendable_cash}")
                 ok, record = self.executor.execute_buy(
                     ticker=ticker,
                     target_value=trade["value"],
@@ -472,7 +494,7 @@ class TradingBot:
         journal.log_run(
             market_outlook=ai_result.get("market_outlook", ""),
             risk_assessment=ai_result.get("risk_assessment", ""),
-            ai_signals=raw_decisions,
+            ai_signals=raw_ai_decisions,
             final_decisions=validated,
             simulated_trades=planned_trades,
             executed_trades=real_executed,
@@ -486,9 +508,9 @@ class TradingBot:
             market_data=market_data,
             execution_mode=run_summary.get("execution_mode", "SIMULATED"),
             market_closed=run_summary.get("market_closed", False),
-            risk_manager=self.risk_manager,   # <-- NEU
+            risk_manager=self.risk_manager,
         )
-        
+
         duration = (datetime.now() - start_time).seconds
         run_summary.update({
             "completed_at": datetime.now().isoformat(),
