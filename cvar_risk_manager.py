@@ -255,3 +255,107 @@ class CVaRRiskManager:
                 allowed_trades.append(trade)
 
         return allowed_trades, blocked_buys
+
+# ========== NEUE METHODEN IN CVaRRiskManager ==========
+
+    def marginal_cvar_contribution(self, positions: Dict[str, Dict], historical_returns: Dict[str, np.ndarray]) -> Dict[str, float]:
+        """
+        Berechnet den marginalen Beitrag jedes Assets zum Portfolio-CVaR.
+        Returns: {ticker: contribution_in_percent_of_total_cvar}
+        """
+        if not positions or not historical_returns:
+            return {}
+        total_value = sum(p.get("market_value", 0) for p in positions.values())
+        if total_value <= 0:
+            return {}
+        portfolio_returns = self.calculate_portfolio_returns(positions, historical_returns)
+        if len(portfolio_returns) < 2:
+            return {}
+        var, cvar = self.calculate_cvar(portfolio_returns)
+        if cvar == 0:
+            return {}
+        contributions = {}
+        for ticker, pos in positions.items():
+            if ticker not in historical_returns:
+                continue
+            weight = pos.get("market_value", 0) / total_value
+            asset_returns = historical_returns[ticker][-len(portfolio_returns):]
+            # Kovarianz-basierte Approximation des marginalen Beitrags
+            cov = np.cov(asset_returns, portfolio_returns)[0, 1]
+            marginal_beta = cov / np.var(portfolio_returns) if np.var(portfolio_returns) != 0 else 0
+            # Marginaler Beitrag = Gewicht * marginal_beta * (CVaR / VaR?) Vereinfacht: weight * marginal_beta
+            marginal_contrib = weight * marginal_beta
+            contributions[ticker] = float(marginal_contrib)
+        # Normalisieren auf 1 (Summe = 1)
+        total = sum(contributions.values())
+        if total > 0:
+            contributions = {t: v / total for t, v in contributions.items()}
+        return contributions
+
+    def simulate_trade_impact(self, current_positions: Dict[str, Dict], proposed_trade: Dict,
+                              historical_returns: Dict[str, np.ndarray]) -> Dict:
+        """
+        Simuliert die Auswirkung eines einzelnen Trades auf den Portfolio-CVaR.
+        proposed_trade: {"ticker": "AAPL", "action": "BUY", "value_usd": 1000}
+        Returns: {"cvar_before": float, "cvar_after": float, "cvar_change": float, "breach": bool}
+        """
+        if not current_positions or not historical_returns:
+            return {"cvar_before": 0, "cvar_after": 0, "cvar_change": 0, "breach": False}
+        total_value_before = sum(p.get("market_value", 0) for p in current_positions.values())
+        if total_value_before <= 0:
+            return {"cvar_before": 0, "cvar_after": 0, "cvar_change": 0, "breach": False}
+        # Portfolio-Renditen vorher
+        port_returns_before = self.calculate_portfolio_returns(current_positions, historical_returns)
+        _, cvar_before = self.calculate_cvar(port_returns_before)
+        cvar_before = abs(cvar_before)
+
+        # Simuliere neues Portfolio
+        import copy
+        new_positions = copy.deepcopy(current_positions)
+        ticker = proposed_trade["ticker"]
+        action = proposed_trade["action"]
+        value = proposed_trade.get("value_usd", 0)
+        if action == "BUY":
+            if ticker in new_positions:
+                new_positions[ticker]["market_value"] += value
+            else:
+                new_positions[ticker] = {"market_value": value}
+        elif action == "SELL":
+            if ticker in new_positions:
+                new_positions[ticker]["market_value"] = max(0, new_positions[ticker].get("market_value", 0) - value)
+                if new_positions[ticker]["market_value"] == 0:
+                    del new_positions[ticker]
+        # Portfolio-Renditen nachher
+        port_returns_after = self.calculate_portfolio_returns(new_positions, historical_returns)
+        _, cvar_after = self.calculate_cvar(port_returns_after)
+        cvar_after = abs(cvar_after)
+
+        return {
+            "cvar_before": cvar_before,
+            "cvar_after": cvar_after,
+            "cvar_change": cvar_after - cvar_before,
+            "breach": cvar_after > self.cvar_limit_pct,
+        }
+
+    def cvar_adjusted_allocation(self, base_allocation: float, ticker: str,
+                                 positions: Dict[str, Dict], historical_returns: Dict[str, np.ndarray]) -> float:
+        """
+        Berechnet eine CVaR-bereinigte Zielallokation.
+        Prinzip: Allokation ~ (Expected_Return / Marginal_CVaR_Contribution)
+        Hier verwenden wir den Score als Proxy für Expected Return.
+        """
+        if not positions or not historical_returns or ticker not in historical_returns:
+            return base_allocation
+        contributions = self.marginal_cvar_contribution(positions, historical_returns)
+        marginal = contributions.get(ticker, 0.05)  # Fallback
+        if marginal <= 0.01:
+            marginal = 0.01
+        # Je kleiner der marginale Beitrag, desto höher die erlaubte Allokation
+        # Skalierungsfaktor: 1 / marginal (normiert)
+        scale = 1.0 / marginal
+        # Begrenzung auf sinnvollen Bereich (0.5 ... 2.0)
+        scale = max(0.5, min(2.0, scale))
+        adjusted = base_allocation * scale
+        # Max Position Cap beachten
+        max_pos = self.settings.get("max_position_pct", 0.20) if hasattr(self, 'settings') else 0.20
+        return min(adjusted, max_pos)
