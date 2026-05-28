@@ -238,11 +238,10 @@ class TradingBot:
             min_trade_value=min_trade_value,
         )
 
-        # ===== CAPITAL ROTATION (neu) =====
+        # ===== CAPITAL ROTATION =====
         approved_buys = [d for d in validated if d.get("action") == "BUY" and d.get("risk_approved")]
         if approved_buys and total_value > 2000:
             rotator = CapitalRotator()
-            # Cooldown-Ticker für Rotation vermeiden
             cooldown_set = set(cooldown_manager._data.keys()) if hasattr(cooldown_manager, '_data') else set()
             rotation_candidates = rotator.find_rotation_candidates(
                 new_buy_tickers=[d['ticker'] for d in approved_buys],
@@ -266,7 +265,6 @@ class TradingBot:
                 validated.append(forced_sell)
                 decisions_map[sell_ticker] = forced_sell
                 log.info(f"  Capital Rotation: {sell_ticker} → {buy_ticker} (Diff: {diff:.0f}, {reason})")
-            # Rebalancing neu berechnen
             if rotation_candidates:
                 planned_trades = self.portfolio.calculate_rebalancing_trades(
                     target_allocations={
@@ -283,14 +281,51 @@ class TradingBot:
         sell_trades = [t for t in planned_trades if t["action"] == "SELL"]
         buy_trades = [t for t in planned_trades if t["action"] == "BUY"]
 
-        execution_enabled = (
+        # ===== DEBUG: Execution-Flags ausgeben =====
+        execution_enabled_raw = (
             not analysis_only
             and self.mode in ("PAPER", "REAL", "LIVE")
             and self.executor.api is not None
         )
+        log.info(f"🔍 DEBUG: analysis_only={analysis_only}, mode={self.mode}, has_api={self.executor.api is not None}")
+        log.info(f"🔍 DEBUG: execution_enabled_raw={execution_enabled_raw}")
+        log.info(f"🔍 DEBUG: sell_trades count={len(sell_trades)}, buy_trades count={len(buy_trades)}")
+
+        # Final Execution Guard (vor der Ausführung)
+        execution_enabled = execution_enabled_raw
 
         if execution_enabled:
-            # Final Execution Guard
+            # Guard-Validierung (bleibt wie bisher)
+            _guard = self.executor.get_guard()
+            if _guard:
+                md_ok = _guard.validate_market_data(market_data)
+                ai_ok = _guard.validate_ai_response(ai_result)
+                log.info(f"🔍 DEBUG: guard market_data_ok={md_ok}, ai_response_ok={ai_ok}")
+                if not md_ok or not ai_ok:
+                    log.critical(f"[PHASE 4A] Guard-Validierung fehlgeschlagen: market_data={md_ok} ai_response={ai_ok} → Execution deaktiviert.")
+                    execution_enabled = False
+                    run_summary["errors"].append("guard_validation_failed")
+            else:
+                log.warning("🔍 DEBUG: Kein Guard-Objekt vorhanden – überspringe Guard-Prüfung.")
+
+            # Drawdown Kill-Switch
+            if execution_enabled and self._drawdown_monitor:
+                _total = portfolio_summary_before.get("total_value", 0)
+                _peak = portfolio_summary_before.get("peak_value") or _total
+                killed = self._drawdown_monitor.check(
+                    portfolio_value=_total,
+                    peak_value=_peak,
+                    api=self.executor.api,
+                )
+                if killed:
+                    log.critical("[PHASE 4A] Drawdown Kill-Switch ausgelöst → Execution gestoppt.")
+                    execution_enabled = False
+                    run_summary["errors"].append("drawdown_kill_switch")
+
+        log.info(f"🔍 DEBUG: FINAL execution_enabled={execution_enabled}")
+
+        # Final Execution Guard (Anpassung der Trades)
+        if execution_enabled:
             sell_trades, buy_trades, guard_warnings = self._final_execution_guard(
                 sell_trades, buy_trades, portfolio_summary_before
             )
@@ -306,6 +341,7 @@ class TradingBot:
         sells_ok = 0
         buys_ok = 0
 
+        # Phase 1: SELLs
         if execution_enabled and sell_trades:
             log.info(f"\n  ── Phase 1: {len(sell_trades)} SELL(s) ──")
             for trade in sell_trades:
@@ -322,8 +358,9 @@ class TradingBot:
                     )
             run_summary["sells_executed"] = sells_ok
         else:
-            log.info("\n  ── Phase 1: SELL-Phase übersprungen")
+            log.info("\n  ── Phase 1: SELL-Phase übersprungen (keine SELLs oder Execution disabled)")
 
+        # Phase 2: Broker-Sync nach SELLs
         if execution_enabled and sell_trades and self.mode in ("PAPER", "REAL", "LIVE") and self.executor.api:
             log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
             time.sleep(2)
@@ -332,6 +369,7 @@ class TradingBot:
         else:
             log.info("\n  ── Phase 2: Broker-Sync übersprungen")
 
+        # Phase 3: BUYs
         if execution_enabled and buy_trades:
             log.info(f"\n  ── Phase 3: {len(buy_trades)} BUY(s) geplant ──")
             total_value = self.portfolio.get_total_value()
@@ -349,6 +387,7 @@ class TradingBot:
                 if spendable_cash < 1.0:
                     log.info(f"  BUY {ticker}: kein spendbares Cash – übersprungen")
                     continue
+                log.info(f"🔍 DEBUG: Executing BUY {ticker} target_value={trade.get('value')}, spendable={spendable_cash}")
                 ok, record = self.executor.execute_buy(
                     ticker=ticker,
                     target_value=trade["value"],
@@ -371,7 +410,7 @@ class TradingBot:
                     )
             run_summary["buys_executed"] = buys_ok
         else:
-            log.info("\n  ── Phase 3: BUY-Phase übersprungen")
+            log.info("\n  ── Phase 3: BUY-Phase übersprungen (keine BUYs oder Execution disabled)")
 
         run_summary["trades_executed"] = sells_ok + buys_ok
         run_summary["execution_mode"] = "LIVE" if execution_enabled else "SIMULATED"
