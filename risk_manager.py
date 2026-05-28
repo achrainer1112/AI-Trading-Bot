@@ -646,20 +646,71 @@ class RiskManager:
     def get_adaptive_log(self) -> Dict:
         return getattr(self, '_last_adaptive_log', {})
 
-    def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict, market_data: Dict, historical_returns: Dict[str, np.ndarray] = None) -> Tuple[List[Dict], List[str]]:
+    def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict,
+                           market_data: Dict, historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
         if historical_returns is None:
             return decisions, []
         positions = portfolio_summary.get("positions", {})
         total_value = portfolio_summary.get("total_value", 1)
         if total_value <= 0:
             return decisions, []
-        portfolio_returns = self.cvar_manager.calculate_portfolio_returns(positions, historical_returns)
-        cvar_state = self.cvar_manager.evaluate_risk_state(portfolio_returns)
-        if not cvar_state["breach"]:
-            return decisions, []
-        volatility_data = {t: d.get("volatility_annual_pct", 20.0) for t, d in market_data.items()}
-        allowed, blocked = self.cvar_manager.filter_trades_by_cvar(decisions, cvar_state, positions, historical_returns, volatility_data)
-        warnings = [f"CVaR constraint active: {cvar_state['cvar_pct']:.2%} > limit {cvar_state['limit_pct']:.2%}"]
-        for b in blocked:
-            warnings.append(f"Blocked BUY {b['ticker']} due to CVaR breach")
-        return allowed, warnings
+
+        # 1. Aktuellen CVaR berechnen
+        port_returns = self.cvar_manager.calculate_portfolio_returns(positions, historical_returns)
+        cvar_state = self.cvar_manager.evaluate_risk_state(port_returns)
+        cvar_limit = cvar_state["limit_pct"]
+        current_cvar = cvar_state["cvar_pct"]
+
+        # 2. Marginalen Beitrag jedes Assets (für Reporting / Priorität 2)
+        marginal_contrib = self.cvar_manager.marginal_cvar_contribution(positions, historical_returns)
+        if marginal_contrib:
+            log.info(f"CVaR Marginal Contributions: { {t: f'{v:.1%}' for t, v in list(marginal_contrib.items())[:5]} }")
+
+        # 3. Pre-Trade-Simulation für jede BUY-Entscheidung
+        approved = []
+        blocked = []
+        for d in decisions:
+            if d.get("action") != "BUY":
+                approved.append(d)
+                continue
+            trade_sim = self.cvar_manager.simulate_trade_impact(positions, {
+                "ticker": d["ticker"],
+                "action": "BUY",
+                "value_usd": d.get("target_allocation", 0) * total_value
+            }, historical_returns)
+            if trade_sim["breach"]:
+                # Trade würde CVaR überschreiten -> Skalieren oder blockieren
+                # Versuche proportionale Skalierung: Reduziere Zielallokation
+                current_alloc = d.get("target_allocation", 0)
+                if current_alloc > 0.01:
+                    # Skalierungsfaktor: so dass neuer CVaR = Limit
+                    # Vereinfacht: linearer Zusammenhang (nicht exakt, aber gut genug)
+                    scale = (cvar_limit - cvar_state["cvar_pct"]) / trade_sim["cvar_change"] if trade_sim["cvar_change"] != 0 else 0
+                    scale = max(0, min(1, scale))
+                    if scale > 0.3:
+                        new_alloc = current_alloc * scale
+                        d["target_allocation"] = round(new_alloc, 4)
+                        d["reason"] += f" [CVaR scaled: {current_alloc:.1%} -> {new_alloc:.1%}]"
+                        approved.append(d)
+                        log.info(f"CVaR: BUY {d['ticker']} scaled to {new_alloc:.1%}")
+                    else:
+                        blocked.append(d)
+                        log.info(f"CVaR: BUY {d['ticker']} blocked (would exceed CVaR limit)")
+                else:
+                    blocked.append(d)
+            else:
+                approved.append(d)
+
+        # 4. CVaR-basiertes Position Sizing (Priorität 3) für alle BUYs
+        for d in approved:
+            if d.get("action") == "BUY":
+                orig_alloc = d["target_allocation"]
+                adjusted = self.cvar_manager.cvar_adjusted_allocation(
+                    orig_alloc, d["ticker"], positions, historical_returns
+                )
+                if adjusted != orig_alloc:
+                    d["target_allocation"] = round(adjusted, 4)
+                    d["reason"] += f" [CVaR sizing: {orig_alloc:.1%} -> {adjusted:.1%}]"
+                    log.info(f"CVaR sizing: {d['ticker']} {orig_alloc:.1%} -> {adjusted:.1%}")
+
+        return approved, [f"CVaR blocked {len(blocked)} BUYs"] if blocked else []
