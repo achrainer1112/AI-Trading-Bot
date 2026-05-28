@@ -1,36 +1,24 @@
 """
-AI Trading Bot - Konfigurationsdatei (Erweitert)
-=================================================
-PHASE 4A: Live Trading Migration + Erweiterte Risikoparameter
-
+AI Trading Bot - Konfigurationsdatei (erweitert für Rebalancing Engine)
+==================================================
 Neue Parameter:
-  - MAX_DAILY_LOSS_PCT (für Emergency Cash Mode / Circuit Breaker)
-  - CAPITAL_ROTATION_MIN_SCORE_DIFF
-  - CAPITAL_ROTATION_MAX_PER_RUN
-  - DYNAMIC_POSITION_SIZING_ENABLED
-  - VOLATILITY_TARGET (für dynamisches Sizing)
+  - TRANSACTION_COST_MODEL
+  - MIN_TRADE_IMPROVEMENT (Mindestverbesserung für Trade)
+  - MAX_ANNUAL_TURNOVER (Jährlicher Umschlag)
+  - REBALANCING_DRIFT_THRESHOLD (Rebalancing nur bei signifikanter Abweichung)
+  - SWAP_MIN_SCORE_DIFF (Mindest-Score-Differenz für Swap)
 """
 
 import os
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
 from enum import Enum
 from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────────
-# TRADING MODUS – PHASE 4A: LIVE
+# TRADING MODUS
 # ─────────────────────────────────────────────
 TRADING_MODE = os.getenv("TRADING_MODE", "LIVE")
-
-# ─────────────────────────────────────────────
-# LIVE TRADING GATE
-# ─────────────────────────────────────────────
 ALLOW_LIVE_TRADING: bool = os.getenv("ALLOW_LIVE_TRADING", "false").strip().lower() == "true"
-
-# ─────────────────────────────────────────────
-# DRAWDOWN KILL-SWITCH
-# ─────────────────────────────────────────────
 KILL_SWITCH_DRAWDOWN_PCT: float = float(os.getenv("KILL_SWITCH_DRAWDOWN_PCT", "0.08"))
 
 # ─────────────────────────────────────────────
@@ -38,21 +26,18 @@ KILL_SWITCH_DRAWDOWN_PCT: float = float(os.getenv("KILL_SWITCH_DRAWDOWN_PCT", "0
 # ─────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o-mini"
-
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
-
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# RISIKOPROFILE (erweitert)
+# RISIKOPROFILE
 # ─────────────────────────────────────────────
 class RiskProfile(Enum):
     CONSERVATIVE = "conservative"
     BALANCED = "balanced"
     AGGRESSIVE = "aggressive"
-
 
 RISK_SETTINGS = {
     RiskProfile.CONSERVATIVE: {
@@ -72,10 +57,13 @@ RISK_SETTINGS = {
         "volatility_target": 0.10,
         "max_drawdown_trigger": 0.15,
         "min_buy_score": 65,
-        # NEU: Circuit Breaker / Emergency Cash Mode
-        "max_daily_loss_pct": 0.03,      # 3% Tagesverlust löst Emergency Cash aus
-        "max_intraday_loss_pct": 0.05,   # 5% Intraday-Verlust löst CB1 aus
-        "vix_panic_threshold": 30.0,     # VIX über 30 löst DE_RISK_50 aus
+        "max_daily_loss_pct": 0.03,
+        "max_intraday_loss_pct": 0.05,
+        "vix_panic_threshold": 30.0,
+        # Neue Parameter für Rebalancing Engine
+        "max_annual_turnover": 2.0,          # 200% jährlicher Umschlag (bei 200 Tagen = 1% pro Tag)
+        "rebalancing_drift_threshold": 0.03,  # 3% Abweichung löst Rebalancing aus
+        "min_trade_improvement": 0.005,       # 0.5% Mindestverbesserung für Trade
     },
     RiskProfile.BALANCED: {
         "max_position_pct": 0.20,
@@ -94,10 +82,13 @@ RISK_SETTINGS = {
         "volatility_target": 0.15,
         "max_drawdown_trigger": 0.20,
         "min_buy_score": 60,
-        # NEU
         "max_daily_loss_pct": 0.05,
         "max_intraday_loss_pct": 0.07,
         "vix_panic_threshold": 35.0,
+        # Neue Parameter
+        "max_annual_turnover": 3.0,           # 300% jährlich (etwas aktiver)
+        "rebalancing_drift_threshold": 0.02,  # 2% Abweichung
+        "min_trade_improvement": 0.003,       # 0.3% Mindestverbesserung
     },
     RiskProfile.AGGRESSIVE: {
         "max_position_pct": 0.30,
@@ -116,49 +107,71 @@ RISK_SETTINGS = {
         "volatility_target": 0.25,
         "max_drawdown_trigger": 0.30,
         "min_buy_score": 55,
-        # NEU
         "max_daily_loss_pct": 0.08,
         "max_intraday_loss_pct": 0.10,
         "vix_panic_threshold": 40.0,
+        # Neue Parameter
+        "max_annual_turnover": 5.0,
+        "rebalancing_drift_threshold": 0.01,  # 1% Abweichung (aktiver)
+        "min_trade_improvement": 0.002,       # 0.2% Mindestverbesserung
     },
 }
 
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 
 # ─────────────────────────────────────────────
-# CAPITAL ROTATION (neu)
+# TRANSACTION COST MODELL
 # ─────────────────────────────────────────────
-CAPITAL_ROTATION_ENABLED = True
-CAPITAL_ROTATION_MIN_SCORE_DIFF = 15.0      # Mindest-Score-Differenz für Rotation
-CAPITAL_ROTATION_MAX_PER_RUN = 2            # Max. Rotationen pro Run
-CAPITAL_ROTATION_MIN_VALUE_USD = 50.0      # Mindestwert für Rotation
-CAPITAL_ROTATION_MIN_HOLD_DAYS = 5          # Position muss mind. 5 Tage gehalten sein
+TRANSACTION_COST_MODEL = {
+    "base_spread_bps": 10.0,          # 10 Basispunkte Spread (0.1%)
+    "impact_factor": 0.5,              # Markteinfluss-Faktor
+    "min_cost_usd": 1.0,              # Mindestkosten pro Trade in USD
+    "fixed_fee_usd": 0.0,             # Feste Gebühr pro Trade (z.B. Broker)
+}
 
 # ─────────────────────────────────────────────
-# DYNAMIC POSITION SIZING (neu)
+# CAPITAL ROTATION & SWAP LOGIC
+# ─────────────────────────────────────────────
+CAPITAL_ROTATION_ENABLED = True
+CAPITAL_ROTATION_MIN_SCORE_DIFF = 15.0
+CAPITAL_ROTATION_MAX_PER_RUN = 2
+CAPITAL_ROTATION_MIN_VALUE_USD = 100.0
+CAPITAL_ROTATION_MIN_HOLD_DAYS = 5
+
+# SWAP: Mindest-Score-Differenz für einen Austausch (wenn Cash knapp)
+SWAP_MIN_SCORE_DIFF = 12.0
+SWAP_MIN_MOMENTUM_ADVANTAGE = 5.0   # 5% Momentum-Vorteil
+
+# ─────────────────────────────────────────────
+# DYNAMIC POSITION SIZING
 # ─────────────────────────────────────────────
 DYNAMIC_POSITION_SIZING_ENABLED = True
-VOLATILITY_TARGET = 0.15                    # Zielvolatilität für Skalierung
+VOLATILITY_TARGET = 0.15
 MAX_VOLATILITY_FACTOR = 2.0
 MIN_VOLATILITY_FACTOR = 0.5
 
 # ─────────────────────────────────────────────
-# SCORE GUARDRAILS (neu)
+# SCORE GUARDRAILS
 # ─────────────────────────────────────────────
 SCORE_GUARDRAIL_STRICT = True
-SCORE_MIN_FOR_BUY = 50                      # Absolutes Minimum
-SCORE_MIN_FOR_BUY_BEAR = 65                 # Höheres Minimum im Bärenmarkt
-SCORE_BUY_WITHOUT_GUARDRAIL = 60            # Ohne Guardrail-Override
+SCORE_MIN_FOR_BUY = 50
+SCORE_MIN_FOR_BUY_BEAR = 65
+SCORE_BUY_WITHOUT_GUARDRAIL = 60
+
+# ─────────────────────────────────────────────
+# REBALANCING ENGINE
+# ─────────────────────────────────────────────
+REBALANCING_ENGINE_ENABLED = True
+REBALANCING_MIN_DRIFT = 0.02          # 2% Mindestabweichung für Rebalancing
+REBALANCING_MAX_TRADES = 8            # Max. Trades pro Rebalancing
+REBALANCING_QUALITY_FOCUS = True      # Qualitätsgewichtung aktivieren
 
 # ─────────────────────────────────────────────
 # WATCHLIST & ETFs
 # ─────────────────────────────────────────────
 ETF_WATCHLIST = ["SPY", "QQQ", "VT"]
 SECTOR_ETFS = ["XLV", "XLF", "XLE", "XLK"]
-STOCK_WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
-    "JPM", "V", "MA", "AMD",
-]
+STOCK_WATCHLIST = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "JPM", "V", "MA", "AMD"]
 FULL_WATCHLIST = ETF_WATCHLIST + SECTOR_ETFS + STOCK_WATCHLIST
 
 SECTOR_CLASSIFICATION = {
@@ -200,7 +213,7 @@ PORTFOLIO_HISTORY_FILE = "logs/portfolio_history.json"
 LOG_DIR = "logs"
 
 INITIAL_CAPITAL = 100_000.0
-MIN_ORDER_VALUE = 10.0
+MIN_ORDER_VALUE = 10.0          # reduziert für kleine Konten (Alpaca fractional shares)
 
 # ─────────────────────────────────────────────
 # SCORE ENGINE
@@ -212,7 +225,7 @@ LLM_SCORE_OVERRIDE_LIMIT = 15
 # ─────────────────────────────────────────────
 # REBALANCING / TRADE FRICTION
 # ─────────────────────────────────────────────
-TRADE_FRICTION_PCT = 0.001
+TRADE_FRICTION_PCT = 0.001        # 0.1% (10 Basispunkte)
 TAX_ESTIMATE_PCT = 0.0
 DEFAULT_ASSET_COOLDOWN_DAYS = 2
 COOLDOWN_FILE = "logs/trade_cooldowns.json"
