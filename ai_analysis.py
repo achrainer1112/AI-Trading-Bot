@@ -205,7 +205,9 @@ class AIAnalyzer:
             prompt_parts.append(f"Target positions: {len(portfolio_allocation.target_allocations)}")
             prompt_parts.append(f"Cash target: {portfolio_allocation.cash_target:.1%}")
             if hasattr(portfolio_allocation, 'rationale') and portfolio_allocation.rationale:
-                prompt_parts.append(f"Rationale: {portfolio_allocation.rationale}")
+                # rationale kann ein String oder ein Dict sein
+                rationale_text = portfolio_allocation.rationale if isinstance(portfolio_allocation.rationale, str) else str(portfolio_allocation.rationale)
+                prompt_parts.append(f"Rationale: {rationale_text}")
             prompt_parts.append("")
             prompt_parts.append(f"{'Ticker':<8} {'TargetAlloc':>11}")
             prompt_parts.append("-" * 25)
@@ -423,7 +425,14 @@ class AIAnalyzer:
                 d["reason"] = str(d.get("reason", ""))[:200]
 
                 ticker = d["ticker"]
-                quant_score = float(d.get("quant_score", 0))
+                # 🔥 FIX: quant_score kann None sein
+                quant_score_raw = d.get("quant_score")
+                if quant_score_raw is None:
+                    quant_score_raw = 0
+                try:
+                    quant_score = float(quant_score_raw)
+                except (TypeError, ValueError):
+                    quant_score = 0.0
 
                 if quant_score == 0 and ticker in scores:
                     quant_score = scores[ticker].total_score
@@ -517,7 +526,14 @@ class AIAnalyzer:
             target_alloc = portfolio_allocation.target_allocations.get(ticker)
             if target_alloc is not None:
                 action = "BUY"
-                reason = f"Portfolio-optimized: {portfolio_allocation.rationale.get(ticker, '') if hasattr(portfolio_allocation, 'rationale') else 'Rebalancing Engine'}"
+                # 🔥 FIX: rationale kann ein String oder ein Dict sein
+                rationale_value = ""
+                if hasattr(portfolio_allocation, 'rationale'):
+                    if isinstance(portfolio_allocation.rationale, dict):
+                        rationale_value = portfolio_allocation.rationale.get(ticker, "")
+                    elif isinstance(portfolio_allocation.rationale, str):
+                        rationale_value = portfolio_allocation.rationale
+                reason = f"Portfolio-optimized: {rationale_value}" if rationale_value else "Portfolio-optimized (Rebalancing Engine)"
             elif ticker in getattr(portfolio_allocation, 'recommended_sells', []):
                 action = "SELL"
                 target_alloc = 0.0
