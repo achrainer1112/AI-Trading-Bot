@@ -102,6 +102,13 @@ RISK_SETTINGS = {
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 
 # ─────────────────────────────────────────────
+# SCORE ENGINE (fehlende Konstanten)
+# ─────────────────────────────────────────────
+DEFAULT_MIN_BUY_SCORE = 60
+SCORE_TOP_K_CANDIDATES = 8
+LLM_SCORE_OVERRIDE_LIMIT = 15
+
+# ─────────────────────────────────────────────
 # REGIME-AWARE RISK ENGINE
 # ─────────────────────────────────────────────
 REGIME_CONFIDENCE_THRESHOLDS = {
