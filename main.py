@@ -1,20 +1,36 @@
 """
-AI Trading Bot - Hauptprogramm (Production) mit Decision Weighting Engine
-=======================================================================
+AI Trading Bot - Hauptprogramm (Production)
+=============================================
+Korrekte Ausführungsreihenfolge mit allen neuen Modulen:
+
+- Regime Detection (Enhanced)
+- Marktdaten & News
+- Portfolio Manager
+- Score Engine
+- Portfolio Rebalancer (CPO / Rebalancer V3)
+- Decision Weighter (Signal-Fusion)
+- Risk Manager (adaptive Thresholds, CVaR, Circuit Breaker)
+- Decision Filter & Cooldown
+- Rebalancing-Trade-Berechnung
+- Order Aggregation & Execution
+- Journaling
 """
 
 import argparse
 import json
 import time
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 from logger import log, trade_logger
 from config import (
     TRADING_MODE, FULL_WATCHLIST, ETF_WATCHLIST, STOCK_WATCHLIST,
     ACTIVE_RISK_PROFILE, RISK_SETTINGS, SCHEDULE_INTERVAL, SCHEDULE_TIME,
     BACKTEST_START_DATE, BACKTEST_END_DATE, INITIAL_CAPITAL,
-    LOG_DIR, CORRELATION_GROUPS, REBALANCING_ENGINE_ENABLED,
+    LOG_DIR, CORRELATION_GROUPS, CVAR_LOOKBACK_DAYS,
 )
 from data_collector import MarketDataCollector
 from news_collector import NewsCollector
@@ -36,16 +52,13 @@ from config import ALLOW_LIVE_TRADING, KILL_SWITCH_DRAWDOWN_PCT
 from capital_rotator import CapitalRotator
 from portfolio_rebalancer import PortfolioRebalancer, RebalancingDecision
 from decision_weighter import DecisionWeighter, WeightedSignal
+from order_aggregator import aggregate_trades
 
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
 class TradingBot:
-    """
-    Orchestriert alle Module für den vollautomatischen Trading-Ablauf.
-    """
-
     def __init__(self, mode: str = None):
         self.mode = (mode or TRADING_MODE).upper()
         log.info("=" * 70)
@@ -53,8 +66,6 @@ class TradingBot:
         log.info(f"  Modus: {self.mode} | Risikoprofil: {ACTIVE_RISK_PROFILE.value.upper()}")
         log.info(f"  Watchlist: {len(FULL_WATCHLIST)} Assets")
         log.info(f"  Markt-Status: {market_status()}")
-        log.info(f"  Rebalancing Engine: {'AKTIV' if REBALANCING_ENGINE_ENABLED else 'INAKTIV'}")
-        log.info("  Decision Weighting Engine: AKTIV")
         log.info("=" * 70)
 
         self.data_collector = MarketDataCollector(FULL_WATCHLIST)
@@ -73,15 +84,12 @@ class TradingBot:
         _guard = self.executor.get_guard()
         self._drawdown_monitor = DrawdownMonitor(guard=_guard, limit_pct=KILL_SWITCH_DRAWDOWN_PCT) if _guard else None
 
-    # ─── Hauptablauf ──────────────────────────────────────────────────────────
-
     def run(self) -> Dict:
         start_time = datetime.now()
         log.info(f"\n{'='*70}")
         log.info(f"  TRADING RUN GESTARTET: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         market_open = is_market_open()
         analysis_only = not market_open
-
         log.info(f"  Markt: {market_status()}")
         if analysis_only:
             log.warning("Market closed -> analysis-only mode activated")
@@ -101,7 +109,7 @@ class TradingBot:
             "analysis_only": analysis_only,
         }
 
-        # SCHRITT 0: Markt-Regime erkennen
+        # SCHRITT 0: Markt-Regime
         log.info("SCHRITT 0/8: Markt-Regime-Detektion...")
         try:
             regime_detector = EnhancedMarketRegimeDetector(watchlist=FULL_WATCHLIST)
@@ -110,7 +118,7 @@ class TradingBot:
             run_summary["regime"] = regime_state.to_dict()
             save_json_file(f"{LOG_DIR}/regime_{start_time.strftime('%Y%m%d_%H%M%S')}.json", regime_state.to_dict())
         except Exception as e:
-            log.warning(f"Regime-Detektion fehlgeschlagen: {e} – fahre ohne Regime-Override fort.")
+            log.warning(f"Regime-Detektion fehlgeschlagen: {e}")
             regime_state = None
 
         # SCHRITT 1: Marktdaten
@@ -132,32 +140,29 @@ class TradingBot:
         portfolio_summary_before = self._build_portfolio_summary()
         self.portfolio.print_summary()
 
-        # Zombie-Positionen
         zombie_tickers = find_zombie_positions(self.portfolio.positions)
         zombie_orders = build_zombie_sell_orders(zombie_tickers, self.portfolio.positions)
 
-        # SCHRITT 4: KI-Analyse & Entscheidungsfindung
+        # SCHRITT 4: KI-Analyse & Rebalancing
         log.info("\nSCHRITT 4/8: KI-Analyse & Entscheidungsfindung...")
-        log.info("\nSCHRITT 3.5/8: Trailing Stop Check...")
         trailing_stops = self.portfolio.get_trailing_stop_triggers(market_data, trail_pct=0.12)
         if trailing_stops:
             log.info(f"  {len(trailing_stops)} Trailing Stop Trigger(s) erkannt")
 
         effective_watchlist = list(set(FULL_WATCHLIST) | set(self.portfolio.positions.keys()))
 
-        # ScoreEngine für Scores, Momentum, Volatilität
         from score_engine import ScoreEngine
         score_engine = ScoreEngine(positions=self.portfolio.positions, total_value=portfolio_summary_before.get("total_value", 100_000))
         spy_return = market_data.get("SPY", {}).get("return_20d")
         scores_obj = score_engine.score_all(market_data, regime_state, spy_return)
         scores = {ticker: sb.total_score for ticker, sb in scores_obj.items()}
-        momentum = {ticker: sb.momentum_20d or 0.0 for ticker, sb in scores_obj.items()}
-        volatility = {ticker: sb.volatility_annual or 20.0 for ticker, sb in scores_obj.items()}
+        momentums = {ticker: sb.momentum_20d or 0.0 for ticker, sb in scores_obj.items()}
+        volatilities = {ticker: sb.volatility_annual or 20.0 for ticker, sb in scores_obj.items()}
         current_weights = self.portfolio.get_allocations()
         total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
         cash = portfolio_summary_before.get("cash", 0.0)
 
-        # Portfolio Rebalancing Engine (CPO)
+        # Portfolio Rebalancer (CPO / V3)
         rebalancing_decisions, target_weights, cash_target, rebalance_rationale = self.rebalancer.optimize_portfolio(
             scores=scores,
             market_data=market_data,
@@ -167,15 +172,7 @@ class TradingBot:
             regime_state=regime_state,
         )
 
-        # KI-Analyse (nutzt die Rebalancing-Vorschläge als Basis)
-        ai_input_log = {"timestamp": start_time.isoformat(), "watchlist": effective_watchlist, "portfolio": portfolio_summary_before}
-        save_json_file(f"{LOG_DIR}/ai_input_{start_time.strftime('%Y%m%d_%H%M%S')}.json", ai_input_log)
-
-        recent_journal = journal.get_history()[-10:]
-        if recent_journal:
-            log.info(f"  Feedback-Loop: {len(recent_journal)} vergangene Runs geladen.")
-
-        # MockAllocation für KI
+        # KI-Analyse mit Rebalancing-Vorschlag
         class MockAllocation:
             def __init__(self, targets, cash_t, rationale):
                 self.target_allocations = targets
@@ -189,60 +186,45 @@ class TradingBot:
             market_data=market_data,
             news_text=news_text,
             watchlist=effective_watchlist,
-            journal_entries=recent_journal,
+            journal_entries=journal.get_history()[-10:],
             regime_state=regime_state,
             portfolio_allocation=mock_allocation,
         )
-        raw_ai_decisions = [dict(d) for d in ai_result.get("decisions", [])]
+        raw_ai_decisions = ai_result.get("decisions", [])
 
-        # ========== DECISION WEIGHTING ENGINE ==========
-        # Erstelle WeightedSignal für alle relevanten Ticker
+        # Decision Weighter (Signal-Fusion)
         weighted_signals = []
-        all_tickers = set(scores_obj.keys()) | set(self.portfolio.positions.keys()) | set(target_weights.keys())
-        high_volatility = market_data.get("vix", 15) > 35
-
-        for ticker in all_tickers:
-            quant_score = scores_obj[ticker].total_score if ticker in scores_obj else 50.0
-            # KI-Konfidenz aus AI-Entscheidungen
-            ai_conf = next((d.get("confidence", 0.5) for d in raw_ai_decisions if d["ticker"] == ticker), 0.5) * 100
-            # Risk Score: abhängig von Volatilität
-            vol = volatility.get(ticker, 20.0)
-            risk_score = max(-1.0, min(1.0, (15.0 - vol) / 50.0))
-            # CPO Score: Zielabweichung
-            current_weight = current_weights.get(ticker, 0.0)
-            target_weight = target_weights.get(ticker, current_weight)
-            cpo_score = max(-1.0, min(1.0, (target_weight - current_weight) * 5))
-            # Risk Approval wird später vom Risk Manager geprüft; hier erstmal True
-            risk_approved = True
-
+        for ticker in set(scores.keys()) | set(self.portfolio.positions.keys()):
+            quant_score = scores.get(ticker, 50.0)
+            ai_conf = next((d.get("confidence", 0.5) * 100 for d in raw_ai_decisions if d["ticker"] == ticker), 50.0)
+            vol = volatilities.get(ticker, 20.0)
+            risk_score = max(-1.0, min(1.0, (15.0 - vol) / 50.0))  # je höher vol, desto negativer
+            current_w = current_weights.get(ticker, 0.0)
+            target_w = target_weights.get(ticker, current_w)
+            cpo_score = max(-1.0, min(1.0, (target_w - current_w) * 5))
+            risk_approved = True  # später vom Risk Manager geprüft
             weighted_signals.append(WeightedSignal(
                 ticker=ticker,
                 quant_score=quant_score,
                 ai_confidence=ai_conf,
                 risk_score=risk_score,
                 cpo_score=cpo_score,
-                current_weight=current_weight,
-                target_weight=target_weight,
+                current_weight=current_w,
+                target_weight=target_w,
                 risk_approved=risk_approved,
             ))
 
-        # Fusioniere die Entscheidungen
+        high_volatility = market_data.get("vix", 15) > 35
         weighted_decisions = self.decision_weighter.process_assets(weighted_signals, regime_state, high_volatility)
-        # Konvertiere in das erwartete Format (target_allocation, etc.)
-        merged_decisions = []
-        for wd in weighted_decisions:
-            merged_decisions.append({
-                "ticker": wd["ticker"],
-                "action": wd["action"],
-                "target_allocation": wd["target_weight"],
-                "confidence": wd["confidence"],
-                "reason": wd["reason"],
-                "decision_id": f"WEIGHTED_{wd['ticker']}",
-                "risk_approved": True,  # wird später validiert
-            })
-        # ============================================
 
-        # DecisionFilter
+        # Merge: KI-Entscheidungen durch Weighted Decisions ersetzen (wo vorhanden)
+        decision_map = {d["ticker"]: d for d in weighted_decisions}
+        for d in raw_ai_decisions:
+            if d["ticker"] not in decision_map:
+                decision_map[d["ticker"]] = d
+        merged_decisions = list(decision_map.values())
+
+        # Decision Filter
         log.info("\nSCHRITT 4b/8: Decision quality filter...")
         filtered_decisions, filter_warnings = apply_decision_filter(
             decisions=merged_decisions,
@@ -252,8 +234,7 @@ class TradingBot:
             market_data=market_data,
             regime_state=regime_state,
         )
-        if filter_warnings:
-            run_summary["decision_filter_warnings"] = filter_warnings
+        run_summary["decision_filter_warnings"] = filter_warnings
 
         save_json_file(f"{LOG_DIR}/ai_output_{start_time.strftime('%Y%m%d_%H%M%S')}.json", ai_result)
 
@@ -264,11 +245,11 @@ class TradingBot:
         decisions, cooldown_warnings = cooldown_manager.filter_decisions(decisions)
         if cooldown_warnings:
             run_summary["cooldown_warnings"] = cooldown_warnings
-        log.info(f"  {len(decisions)} Entscheidungen")
+        log.info(f"  {len(decisions)} Entscheidungen | {ai_result.get('market_outlook', '')[:80]}")
         for d in decisions:
             log.info(f"  → {d['action']:<5} {d['ticker']:<6} Allok: {d.get('target_allocation', 0):.0%} | Konfidenz: {d.get('confidence', 0):.0%}")
 
-        # SCHRITT 5: Stop-Loss & Zombie-Cleanup
+        # Stop-Loss & Zombie-Cleanup
         log.info("\nSCHRITT 5/8: Stop-Loss & Zombie-Cleanup...")
         stop_loss_orders = self.risk_manager.check_stop_loss(self.portfolio.positions, market_data)
         decisions = stop_loss_orders + trailing_stops + zombie_orders + decisions
@@ -283,7 +264,7 @@ class TradingBot:
         if norm_warnings:
             run_summary["normalization_warnings"] = norm_warnings
 
-        # SCHRITT 6: Risikoprüfung & Validierung (mit adaptiven Thresholds)
+        # Risikoprüfung & Validierung
         log.info("\nSCHRITT 6/8: Risikoprüfung & Validierung...")
         validated, risk_warnings = self.risk_manager.validate_decisions(
             decisions=normalized_decisions,
@@ -291,6 +272,22 @@ class TradingBot:
             market_data=market_data,
         )
         run_summary["risk_warnings"] = risk_warnings
+
+        # ===== CVaR Risk Constraint (Tail Risk Management) =====
+        if hasattr(self.data_collector, 'get_historical_returns'):
+            try:
+                all_tickers = list(set(self.portfolio.positions.keys()) | set(FULL_WATCHLIST))
+                historical_returns = self.data_collector.get_historical_returns(all_tickers, days=CVAR_LOOKBACK_DAYS)
+                if historical_returns:
+                    validated, cvar_warnings = self.risk_manager.apply_cvar_constraints(
+                        decisions=validated,
+                        portfolio_summary=portfolio_summary_before,
+                        market_data=market_data,
+                        historical_returns=historical_returns,
+                    )
+                    risk_warnings.extend(cvar_warnings)
+            except Exception as e:
+                log.warning(f"CVaR-Prüfung fehlgeschlagen: {e}")
 
         decisions_map = {d["ticker"]: d for d in validated}
         current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
@@ -303,7 +300,7 @@ class TradingBot:
                 log.info(f"Small account: lowering min_trade_value from ${min_trade_value:.2f} to ${dynamic_min:.2f}")
                 min_trade_value = dynamic_min
 
-        # Rebalancing-Berechnung basierend auf validierten Entscheidungen
+        # Rebalancing-Berechnung
         planned_trades = self.portfolio.calculate_rebalancing_trades(
             target_allocations={
                 d["ticker"]: d.get("target_allocation", 0)
@@ -315,7 +312,7 @@ class TradingBot:
             min_trade_value=min_trade_value,
         )
 
-        # ===== CAPITAL ROTATION =====
+        # Capital Rotation (optional)
         approved_buys = [d for d in validated if d.get("action") == "BUY" and d.get("risk_approved")]
         if approved_buys and total_value > 2000:
             rotator = CapitalRotator()
@@ -354,10 +351,33 @@ class TradingBot:
                     min_trade_value=min_trade_value,
                 )
 
-        sell_trades = [t for t in planned_trades if t["action"] == "SELL"]
-        buy_trades = [t for t in planned_trades if t["action"] == "BUY"]
+        # Trade Aggregation
+        agg_input = [{
+            "ticker": t["ticker"],
+            "action": t["action"],
+            "target_allocation": t["target_alloc"],
+            "confidence": t.get("ai_confidence", 0.7),
+        } for t in planned_trades]
+        aggregated = aggregate_trades(agg_input)
+        aggregated_trades = []
+        for agg in aggregated:
+            price = current_prices.get(agg["ticker"])
+            if not price:
+                continue
+            aggregated_trades.append({
+                "ticker": agg["ticker"],
+                "action": agg["action"],
+                "target_alloc": agg["target_allocation"],
+                "value": agg["target_allocation"] * total_value,
+                "quantity": agg["target_allocation"] * total_value / price,
+                "price": price,
+                "current_alloc": current_weights.get(agg["ticker"], 0.0),
+                "ai_reason": agg.get("reason", "Aggregated trade"),
+                "ai_confidence": agg["confidence"],
+            })
+        sell_trades = [t for t in aggregated_trades if t["action"] == "SELL"]
+        buy_trades = [t for t in aggregated_trades if t["action"] == "BUY"]
 
-        # Debug-Ausgaben
         log.info(f"🔍 DEBUG: analysis_only={analysis_only}, mode={self.mode}, has_api={self.executor.api is not None}")
         log.info(f"🔍 DEBUG: sell_trades count={len(sell_trades)}, buy_trades count={len(buy_trades)}")
 
@@ -372,9 +392,8 @@ class TradingBot:
             if _guard:
                 md_ok = _guard.validate_market_data(market_data)
                 ai_ok = _guard.validate_ai_response(ai_result)
-                log.info(f"🔍 DEBUG: guard market_data_ok={md_ok}, ai_response_ok={ai_ok}")
                 if not md_ok or not ai_ok:
-                    log.critical(f"Guard-Validierung fehlgeschlagen -> Execution deaktiviert.")
+                    log.critical("Guard-Validierung fehlgeschlagen -> Execution deaktiviert.")
                     execution_enabled = False
                     run_summary["errors"].append("guard_validation_failed")
             if execution_enabled and self._drawdown_monitor:
@@ -401,7 +420,6 @@ class TradingBot:
         sells_ok = 0
         buys_ok = 0
 
-        # Phase 1: SELLs
         if execution_enabled and sell_trades:
             log.info(f"\n  ── Phase 1: {len(sell_trades)} SELL(s) ──")
             for trade in sell_trades:
@@ -420,7 +438,6 @@ class TradingBot:
         else:
             log.info("\n  ── Phase 1: SELL-Phase übersprungen")
 
-        # Phase 2: Broker-Sync
         if execution_enabled and sell_trades and self.mode in ("PAPER", "REAL", "LIVE") and self.executor.api:
             log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
             time.sleep(2)
@@ -429,14 +446,12 @@ class TradingBot:
         else:
             log.info("\n  ── Phase 2: Broker-Sync übersprungen")
 
-        # Phase 3: BUYs
         if execution_enabled and buy_trades:
             log.info(f"\n  ── Phase 3: {len(buy_trades)} BUY(s) geplant ──")
             total_value = self.portfolio.get_total_value()
             min_cash_pct = self.risk_manager.settings.get("min_cash_pct", RISK_SETTINGS[ACTIVE_RISK_PROFILE]["min_cash_pct"])
             min_cash_abs = max(0.0, total_value * min_cash_pct)
             running_cash = self.portfolio.cash
-
             for trade in buy_trades:
                 ticker = trade["ticker"]
                 price = current_prices.get(ticker) or trade.get("price", 0)
@@ -478,7 +493,7 @@ class TradingBot:
         if executed_records:
             cooldown_manager.register_executed_trades(executed_records)
 
-        # SCHRITT 8: Journal & Snapshot
+        # JOURNAL
         log.info("\nSCHRITT 8/8: Journal & Portfolio-Snapshot...")
         self._check_portfolio_consistency(market_data)
         portfolio_summary_after = self._build_portfolio_summary()
@@ -486,10 +501,8 @@ class TradingBot:
 
         real_executed = [r for r in executed_records if r.get("status") == "EXECUTED" or (r.get("fill_qty") or 0) > 0]
 
-        if scores_obj:
-            top_scores = sorted(scores_obj.values(), key=lambda x: x.total_score, reverse=True)[:5]
-            log.info("  Top-5 Quant Scores: " + " | ".join(f"{s.ticker}={s.total_score:.0f}({s.signal})" for s in top_scores))
-            save_json_file(f"{LOG_DIR}/scores_{start_time.strftime('%Y%m%d_%H%M%S')}.json", {t: sb.to_dict() for t, sb in scores_obj.items()})
+        top_scores = sorted(scores_obj.values(), key=lambda x: x.total_score, reverse=True)[:5]
+        log.info("  Top-5 Quant Scores: " + " | ".join(f"{s.ticker}={s.total_score:.0f}({s.signal})" for s in top_scores))
 
         journal.log_run(
             market_outlook=ai_result.get("market_outlook", ""),
@@ -529,28 +542,21 @@ class TradingBot:
 
         return run_summary
 
-    # ─── Final Execution Guard ────────────────────────────────────────────────
-    def _final_execution_guard(self, sell_trades: List[Dict], buy_trades: List[Dict], portfolio_summary: Dict) -> Tuple[List[Dict], List[Dict], List[str]]:
+    # Hilfsmethoden (unverändert)
+    def _final_execution_guard(self, sell_trades, buy_trades, portfolio_summary):
         warnings = []
         _profile = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
         max_position_pct = _profile["max_position_pct"]
         min_cash_pct = _profile["min_cash_pct"]
         total_value = portfolio_summary.get("total_value", self.portfolio.get_total_value())
         min_cash_abs = total_value * min_cash_pct
-
         available_cash = portfolio_summary.get("cash", self.portfolio.cash)
         total_buy_value = sum(t.get("value", 0) for t in buy_trades)
         projected_cash = available_cash - total_buy_value
-
         if projected_cash < min_cash_abs:
-            shortfall = min_cash_abs - projected_cash
-            warnings.append(f"Cash guard: projected cash ${projected_cash:,.0f} < reserve ${min_cash_abs:,.0f} → reducing BUY sizes")
-            if total_buy_value > 0:
-                scale = max(0.0, (available_cash - min_cash_abs) / total_buy_value)
-                for trade in buy_trades:
-                    orig = trade.get("value", 0)
-                    trade["value"] = round(orig * scale, 2)
-
+            scale = max(0.0, (available_cash - min_cash_abs) / total_buy_value) if total_buy_value > 0 else 0
+            for trade in buy_trades:
+                trade["value"] = round(trade.get("value", 0) * scale, 2)
         for trade in buy_trades:
             ticker = trade.get("ticker", "")
             current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0.0)
@@ -558,30 +564,22 @@ class TradingBot:
             projected_val = current_val + buy_val
             cap_val = total_value * max_position_pct
             if projected_val > cap_val:
-                clamped_buy = max(0.0, cap_val - current_val)
-                warnings.append(f"Position cap guard: {ticker} projected ${projected_val:,.0f} > cap ${cap_val:,.0f} → clamped to ${clamped_buy:,.0f}")
-                trade["value"] = round(clamped_buy, 2)
-
-        original_buy_count = len(buy_trades)
+                clamped = max(0.0, cap_val - current_val)
+                trade["value"] = round(clamped, 2)
+                warnings.append(f"Cap guard: {ticker} {current_val:,.0f}→{projected_val:,.0f} > cap {cap_val:,.0f}")
         buy_trades = [t for t in buy_trades if t.get("value", 0) >= 1.0]
-        if len(buy_trades) != original_buy_count:
-            warnings.append(f"Guard stripped {original_buy_count - len(buy_trades)} zero-value BUY(s)")
-
         return sell_trades, buy_trades, warnings
 
-    # ─── Portfolio-Konsistenz ────────────────────────────────────────────────
-    def _check_portfolio_consistency(self, market_data: Dict):
+    def _check_portfolio_consistency(self, market_data):
         if self.mode not in ("PAPER", "REAL", "LIVE") or not self.executor.api:
             return
         try:
             account = self.executor.api.get_account()
             broker_cash = float(account.cash)
             local_cash = self.portfolio.cash
-            cash_diff = abs(broker_cash - local_cash)
-            if cash_diff > 1.0:
+            if abs(broker_cash - local_cash) > 1.0:
                 log.warning(f"[KONSISTENZ] Cash-Abweichung: lokal {format_currency(local_cash)} vs Broker {format_currency(broker_cash)}")
                 self.portfolio._load_from_alpaca()
-                log.info("[KONSISTENZ] Portfolio mit Broker re-synchronisiert.")
         except Exception as e:
             log.warning(f"[KONSISTENZ] Check fehlgeschlagen: {e}")
 
@@ -595,11 +593,9 @@ class TradingBot:
         price = current_prices.get(ticker, trade.get("price", 0))
         is_zombie = trade.get("zombie_cleanup", False)
         if (not price or price <= 0) and is_zombie:
-            log.info(f"[ZOMBIE] {ticker}: kein Preis → force_close_position()")
             return self.executor._force_close_position(ticker, 0.0, trade.get("ai_reason", "Zombie liquidation"))
         if (not price or price <= 0) and trade.get("price_estimated") and trade.get("price", 0) > 0:
             price = trade["price"]
-            log.info(f"[SELL] {ticker}: kein Marktpreis → Fallback Ø-Kaufpreis ${price:.2f}")
         position_qty = self.portfolio.positions.get(ticker, {}).get("quantity", 0)
         return self.executor.execute_sell(
             ticker=ticker,
@@ -619,17 +615,13 @@ class TradingBot:
         log.info(f"Markt-Status: {market_status()}")
 
 
-# ─── Standalone-Funktionen ────────────────────────────────────────────────────
 def run_backtest(use_ai: bool = False):
     tickers = ETF_WATCHLIST + STOCK_WATCHLIST[:5]
     if use_ai:
-        log.info("Starte KI-Backtest...")
         from config import OPENAI_API_KEY
-        has_key = bool(OPENAI_API_KEY)
-        bt = AIBacktester(tickers=tickers, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE, frequency="weekly", use_ai=has_key)
-        result = bt.run()
-        bt.save_results(result)
-        return result
+        bt = AIBacktester(tickers=tickers, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE, frequency="weekly", use_ai=bool(OPENAI_API_KEY))
+        bt.run()
+        bt.save_results(bt.run())
 
 
 def run_scheduler(bot: TradingBot):
@@ -642,10 +634,8 @@ def run_scheduler(bot: TradingBot):
     if SCHEDULE_INTERVAL == "daily":
         schedule.every().day.at(SCHEDULE_TIME).do(bot.run)
     elif SCHEDULE_INTERVAL == "weekly":
-        from config import SCHEDULE_WEEKDAY
         days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
         getattr(schedule.every(), days[min(SCHEDULE_WEEKDAY, 4)]).at(SCHEDULE_TIME).do(bot.run)
-    log.info("Scheduler läuft. Ctrl+C zum Beenden.")
     while True:
         schedule.run_pending()
         time.sleep(60)
@@ -654,16 +644,14 @@ def run_scheduler(bot: TradingBot):
 def main():
     parser = argparse.ArgumentParser(description="AI Trading Bot")
     parser.add_argument("--mode", choices=["dry", "paper", "real", "live"], default=TRADING_MODE.lower())
-    parser.add_argument("--backtest", action="store_true", help="Momentum-Backtest (Baseline)")
-    parser.add_argument("--ai", action="store_true", help="KI-Backtest statt Momentum-Baseline (mit --backtest)")
+    parser.add_argument("--backtest", action="store_true")
+    parser.add_argument("--ai", action="store_true")
     parser.add_argument("--schedule", action="store_true")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
-
     if args.backtest:
         run_backtest(use_ai=args.ai)
         return
-
     bot = TradingBot(mode=args.mode)
     if args.status:
         bot.show_status()
