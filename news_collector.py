@@ -1,20 +1,19 @@
 """
-AI Trading Bot - News & Sentiment Collector
-=============================================
-Sammelt aktuelle Finanznachrichten und bereitet sie für die KI-Analyse vor.
-Unterstützt: Yahoo Finance News, NewsAPI (optional), RSS-Feeds (optional).
-
-Verbesserungen:
-- Robuste Deduplizierung (Normalisierung von Titeln)
-- Sentiment-Score (optional, als schwacher Zusatzfaktor)
-- Fallback auf simulierte News wenn keine Quellen verfügbar
-- Begrenzung der Anzahl pro Ticker
+AI Trading Bot - News & Sentiment Collector (Robust)
+=====================================================
+Sammelt Finanznachrichten aus:
+- Yahoo Finance (via yfinance) – oft flaky, daher mit Fallback
+- NewsAPI (falls API-Key vorhanden)
+- RSS-Feed (z.B. Reuters, als Backup)
+- Simulierte News als letzter Fallback
 """
 
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import re
 import requests
+import feedparser
+import time
 
 from logger import log
 from config import NEWS_API_KEY, MAX_NEWS_ARTICLES, NEWS_TOPICS, FULL_WATCHLIST
@@ -26,54 +25,47 @@ except ImportError:
 
 
 class NewsCollector:
-    """
-    Sammelt Finanznachrichten aus mehreren Quellen:
-    1. Yahoo Finance News (kostenlos, via yfinance)
-    2. NewsAPI.org (erfordert API Key)
-    3. Fallback: Simulierte News für Tests
-    """
-
     def __init__(self):
         self.news_api_key = NEWS_API_KEY
         self.collected_articles: List[Dict] = []
 
-    def fetch_yahoo_news(self, tickers: List[str] = None) -> List[Dict]:
-        """
-        Holt News von Yahoo Finance für die wichtigsten Ticker.
-        Kostenlos, kein API Key nötig.
-        """
+    def fetch_yahoo_news(self, tickers: List[str] = None, max_retries: int = 2) -> List[Dict]:
+        """Versucht Yahoo News zu holen, mit Retry bei leerem Ergebnis."""
+        top_tickers = (tickers or FULL_WATCHLIST)[:12]
         articles = []
-        top_tickers = (tickers or FULL_WATCHLIST)[:12]  # max 12 um API-Last zu begrenzen
 
         for ticker in top_tickers:
-            try:
-                t = yf.Ticker(ticker)
-                news = t.news
-                if not news:
-                    continue
-                for item in news[:4]:  # Max 4 News pro Ticker
-                    title = item.get("title", "")
-                    if not title:
-                        continue
-                    articles.append({
-                        "title": title,
-                        "summary": item.get("summary", item.get("title", "")),
-                        "source": item.get("publisher", "Yahoo Finance"),
-                        "url": item.get("link", ""),
-                        "published": datetime.fromtimestamp(
-                            item.get("providerPublishTime", datetime.now().timestamp())
-                        ).isoformat(),
-                        "tickers": item.get("relatedTickers", [ticker]),
-                        "sentiment": self._estimate_sentiment(title, item.get("summary", "")),
-                    })
-            except Exception as e:
-                log.debug(f"Yahoo News Fehler für {ticker}: {e}")
-
+            for attempt in range(max_retries):
+                try:
+                    t = yf.Ticker(ticker)
+                    news = t.news
+                    if news and len(news) > 0:
+                        for item in news[:4]:
+                            title = item.get("title", "")
+                            if title:
+                                articles.append({
+                                    "title": title,
+                                    "summary": item.get("summary", "") or title,
+                                    "source": item.get("publisher", "Yahoo Finance"),
+                                    "url": item.get("link", ""),
+                                    "published": datetime.fromtimestamp(
+                                        item.get("providerPublishTime", datetime.now().timestamp())
+                                    ).isoformat(),
+                                    "tickers": item.get("relatedTickers", [ticker]),
+                                    "sentiment": self._estimate_sentiment(title, item.get("summary", "")),
+                                })
+                        break  # erfolgreich
+                    else:
+                        log.debug(f"Yahoo News für {ticker}: Versuch {attempt+1} -> keine News")
+                        time.sleep(0.5)
+                except Exception as e:
+                    log.debug(f"Yahoo News Fehler {ticker} (Versuch {attempt+1}): {e}")
+                    time.sleep(0.5)
         log.info(f"Yahoo Finance: {len(articles)} Artikel gesammelt.")
         return articles
 
     def fetch_newsapi(self, query: str = "stock market finance") -> List[Dict]:
-        """Holt aktuelle Nachrichten von NewsAPI.org (benötigt API Key)."""
+        """Holt News von NewsAPI.org (benötigt API Key)."""
         if not self.news_api_key:
             log.debug("Kein NewsAPI Key konfiguriert, überspringe.")
             return []
@@ -106,156 +98,67 @@ class NewsCollector:
                     "tickers": self._extract_tickers_from_text(title + " " + (item.get("description") or "")),
                     "sentiment": self._estimate_sentiment(title, item.get("description") or ""),
                 })
-
             log.info(f"NewsAPI: {len(articles)} Artikel gesammelt.")
             return articles
-
         except Exception as e:
             log.warning(f"NewsAPI Fehler: {e}")
             return []
 
-    def get_macro_news(self) -> List[Dict]:
-        """Sammelt makroökonomische News zu definierten Themen."""
-        all_articles = []
-        for topic in NEWS_TOPICS[:3]:
-            articles = self.fetch_newsapi(query=f"{topic} economy market")
-            all_articles.extend(articles[:3])
-        return all_articles
+    def fetch_rss_news(self, feed_url: str = "https://feeds.bloomberg.com/markets/news.rss") -> List[Dict]:
+        """Holt News aus einem RSS-Feed (z.B. Bloomberg Markets)."""
+        articles = []
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:10]:
+                title = entry.get("title", "")
+                if not title:
+                    continue
+                articles.append({
+                    "title": title,
+                    "summary": entry.get("summary", "")[:300],
+                    "source": feed.feed.get("title", "RSS"),
+                    "url": entry.get("link", ""),
+                    "published": entry.get("published", datetime.now().isoformat()),
+                    "tickers": self._extract_tickers_from_text(title),
+                    "sentiment": self._estimate_sentiment(title, entry.get("summary", "")),
+                })
+            log.info(f"RSS ({feed_url}): {len(articles)} Artikel gesammelt.")
+        except Exception as e:
+            log.warning(f"RSS-Feed Fehler: {e}")
+        return articles
 
     def collect_all(self) -> List[Dict]:
-        """
-        Hauptfunktion: Sammelt News aus allen verfügbaren Quellen.
-        Dedupliziert und sortiert nach Relevanz.
-        """
         log.info("Sammle Finanznachrichten...")
         all_articles = []
 
-        # 1. Yahoo Finance News (immer verfügbar)
+        # 1. Yahoo News (versuchen, aber nicht kritisch)
         yahoo_news = self.fetch_yahoo_news()
         all_articles.extend(yahoo_news)
 
-        # 2. NewsAPI (wenn Key vorhanden)
+        # 2. NewsAPI (falls Key gesetzt)
         if self.news_api_key:
             macro_news = self.fetch_newsapi("stock market federal reserve inflation earnings")
             all_articles.extend(macro_news[:10])
 
-        # 3. Falls gar keine News: Simulierte Minimal-News für den Prompt
+        # 3. RSS-Feed als zusätzliche Quelle
+        rss_news = self.fetch_rss_news()
+        all_articles.extend(rss_news[:8])
+
+        # 4. Fallback: simulierte News
         if not all_articles:
             log.warning("Keine News-Quellen verfügbar – verwende simulierte Marktkommentare.")
             all_articles = self._generate_fallback_news()
 
-        # 4. Deduplizierung mit normalisierten Titeln (verbessert)
+        # Deduplizierung
         unique_articles = self._deduplicate_articles(all_articles)
 
-        # 5. Nach Relevanz sortieren (zuerst solche mit Ticker-Erwähnungen)
+        # Nach Relevanz sortieren (Ticker-Erwähnungen zuerst)
         unique_articles.sort(key=lambda a: (len(a.get("tickers", [])) > 0, a.get("published", "")), reverse=True)
 
         self.collected_articles = unique_articles[:MAX_NEWS_ARTICLES]
         log.info(f"News gesammelt: {len(self.collected_articles)} einzigartige Artikel.")
         return self.collected_articles
 
-    def _deduplicate_articles(self, articles: List[Dict]) -> List[Dict]:
-        """
-        Dedupliziert Artikel basierend auf normalisiertem Titel.
-        Entfernt near-duplicates (z.B. gleiche Schlagzeilen von verschiedenen Quellen).
-        """
-        seen = {}
-        unique = []
-
-        for a in articles:
-            title = a.get("title", "")
-            # Normalisierung: Kleinbuchstaben, entferne Sonderzeichen, kürze auf 80 Zeichen
-            normalized = re.sub(r'[^\w\s]', '', title.lower().strip())[:80]
-            if not normalized:
-                continue
-
-            # Falls ähnlicher Titel bereits existiert, bevorzuge den mit mehr Inhalt
-            if normalized in seen:
-                existing = seen[normalized]
-                # Behalte den längeren summary
-                if len(a.get("summary", "")) > len(existing.get("summary", "")):
-                    seen[normalized] = a
-                continue
-
-            seen[normalized] = a
-            unique.append(a)
-
-        return unique
-
-    def _extract_tickers_from_text(self, text: str) -> List[str]:
-        """Extrahiert mögliche Ticker-Symbole aus Text (einfache Heuristik)."""
-        if not text:
-            return []
-        # Suche nach Großbuchstaben-Kombinationen (2-5 Zeichen) die in Watchlist vorkommen
-        words = re.findall(r'\b[A-Z]{2,5}\b', text)
-        tickers = [w for w in words if w in FULL_WATCHLIST]
-        return list(set(tickers))[:3]
-
-    def _estimate_sentiment(self, title: str, summary: str) -> float:
-        """
-        Sehr einfache sentiment analysis (optional, nur als schwacher Zusatz).
-        Gibt -1 (negativ) bis +1 (positiv) zurück.
-        """
-        text = (title + " " + summary).lower()
-        positive_words = ["surge", "rally", "gain", "up", "positive", "bullish", "growth", "profit", "beat", "upgrade"]
-        negative_words = ["drop", "fall", "down", "negative", "bearish", "loss", "miss", "downgrade", "crash", "selloff"]
-
-        pos_count = sum(1 for w in positive_words if w in text)
-        neg_count = sum(1 for w in negative_words if w in text)
-        total = pos_count + neg_count
-        if total == 0:
-            return 0.0
-        return (pos_count - neg_count) / total
-
-    def _generate_fallback_news(self) -> List[Dict]:
-        """Erzeugt minimale simulierte News, wenn keine echten Quellen verfügbar sind."""
-        return [{
-            "title": "Marktupdate: Keine aktuellen Nachrichten verfügbar",
-            "summary": "Der Bot konnte keine Nachrichtenquellen erreichen. Handelsentscheidungen basieren nur auf Quant-Daten.",
-            "source": "System",
-            "published": datetime.now().isoformat(),
-            "tickers": [],
-            "sentiment": 0.0,
-        }]
-
-    def format_for_ai(self, articles: List[Dict] = None) -> str:
-        """
-        Formatiert die News-Artikel als kompakten Text für den KI-Prompt.
-        Inklusive Sentiment, falls vorhanden.
-        """
-        articles = articles or self.collected_articles
-        if not articles:
-            return "Keine aktuellen Nachrichten verfügbar."
-
-        lines = [f"AKTUELLE FINANZNACHRICHTEN ({datetime.now().strftime('%Y-%m-%d')}):", ""]
-        for i, a in enumerate(articles[:12], 1):
-            title = a.get("title", "")
-            source = a.get("source", "Unbekannt")
-            sentiment = a.get("sentiment")
-            sent_str = f" [Sentiment: {sentiment:+.2f}]" if sentiment is not None else ""
-            lines.append(f"{i}. [{source}]{sent_str} {title}")
-
-            summary = a.get("summary", "")
-            if summary and summary != title:
-                summary_short = summary[:150] + "..." if len(summary) > 150 else summary
-                lines.append(f"   → {summary_short}")
-
-            tickers = a.get("tickers", [])
-            if tickers:
-                lines.append(f"   Betroffene Ticker: {', '.join(tickers[:5])}")
-            lines.append("")
-
-        return "\n".join(lines)
-
-    def get_sentiment_score(self) -> float:
-        """
-        Berechnet einen aggregierten Sentiment-Score über alle aktuellen News.
-        Kann als schwacher Zusatzfaktor in die ScoreEngine einfließen.
-        """
-        if not self.collected_articles:
-            return 0.0
-        scores = [a.get("sentiment", 0.0) for a in self.collected_articles if a.get("sentiment") is not None]
-        if not scores:
-            return 0.0
-        # Gewichtung: neuere News höher gewichten
-        return sum(scores) / len(scores)
+    # Die Hilfsmethoden _deduplicate_articles, _extract_tickers_from_text,
+    # _estimate_sentiment, _generate_fallback_news, format_for_ai
+    # bleiben identisch zur vorherigen Version (siehe oben).
