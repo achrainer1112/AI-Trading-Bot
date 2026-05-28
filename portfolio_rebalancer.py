@@ -1,24 +1,19 @@
 """
-portfolio_rebalancer.py – Integration des Continuous Portfolio Optimizer (CPO)
+portfolio_rebalancer.py – Integration des Continuous Portfolio Optimizer
 """
 
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
 from logger import log
-from config import (
-    ACTIVE_RISK_PROFILE,
-    REBALANCING_ENGINE_ENABLED,
-    REBALANCING_MAX_TRADES,
-    SECTOR_CLASSIFICATION,
-)
+from config import ACTIVE_RISK_PROFILE, REBALANCING_ENGINE_ENABLED, REBALANCING_MAX_TRADES
 from cpo_engine import ContinuousPortfolioOptimizer
 
 
 @dataclass
 class RebalancingDecision:
     ticker: str
-    action: str          # BUY, SELL, HOLD
+    action: str
     target_weight: float
     confidence: float
     reason: str
@@ -43,12 +38,12 @@ class PortfolioRebalancer:
         if not self.enabled:
             return [], current_weights, cash / max(total_value, 1), ""
 
-        # Extrahiere Konfidenz, Momentum, Volatilität aus Scores/Market Data
+        # Extrahiere benötigte Felder aus market_data
         confidences = {}
         momentums = {}
         volatilities = {}
         for ticker, data in market_data.items():
-            # Confidence: vorerst aus Score (kann später durch AI-Konfidenz ersetzt werden)
+            # Konfidenz aus Score (vereinfacht, kann auch aus AI kommen)
             sc = scores.get(ticker, 50.0)
             confidences[ticker] = sc / 100.0
             momentums[ticker] = data.get("return_20d", 0.0)
@@ -74,12 +69,12 @@ class PortfolioRebalancer:
             portfolio_value=total_value,
         )
 
-        # Erzeuge RebalancingDecision-Liste aus Differenz
+        # Entscheidungen aus Differenz generieren
         decisions = []
         for ticker, target in target_weights.items():
             current = current_weights.get(ticker, 0.0)
             delta = target - current
-            if abs(delta) < 0.01:   # unter 1% ignorieren
+            if abs(delta) < 0.01:  # unter 1% ignorieren
                 continue
             action = "BUY" if delta > 0 else "SELL"
             conf = confidences.get(ticker, 0.5)
@@ -88,10 +83,10 @@ class PortfolioRebalancer:
                 action=action,
                 target_weight=target,
                 confidence=conf,
-                reason=f"Target {target:.1%} vs current {current:.1%}",
+                reason=f"Target {target:.1%} vs current {current:.1%} (CPO)",
             ))
 
-        # Begrenzen auf max_trades (optional, kann auch entfallen)
+        # Begrenzen auf max_trades (optional)
         decisions = decisions[:self.max_trades]
 
         log.info(f"PortfolioRebalancer (CPO): {len(decisions)} Trades, Cash-Ziel {cash_target:.1%}")
