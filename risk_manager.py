@@ -647,7 +647,7 @@ class RiskManager:
         return getattr(self, '_last_adaptive_log', {})
 
     def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict,
-                           market_data: Dict, historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
+                               market_data: Dict, historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
         if historical_returns is None:
             return decisions, []
         positions = portfolio_summary.get("positions", {})
@@ -661,12 +661,13 @@ class RiskManager:
         cvar_limit = cvar_state["limit_pct"]
         current_cvar = cvar_state["cvar_pct"]
 
-        # 2. Marginalen Beitrag jedes Assets (für Reporting / Priorität 2)
+        # 2. Marginalen Beitrag jedes Assets (für Reporting)
         marginal_contrib = self.cvar_manager.marginal_cvar_contribution(positions, historical_returns)
         if marginal_contrib:
-            log.info(f"CVaR Marginal Contributions: { {t: f'{v:.1%}' for t, v in list(marginal_contrib.items())[:5]} }")
+            top5 = sorted(marginal_contrib.items(), key=lambda x: -x[1])[:5]
+            log.info(f"CVaR Marginal Contributions: { {t: f'{v:.1%}' for t, v in top5} }")
 
-        # 3. Pre-Trade-Simulation für jede BUY-Entscheidung
+        # 3. Pre-Trade-Simulation für jeden BUY
         approved = []
         blocked = []
         for d in decisions:
@@ -679,13 +680,11 @@ class RiskManager:
                 "value_usd": d.get("target_allocation", 0) * total_value
             }, historical_returns)
             if trade_sim["breach"]:
-                # Trade würde CVaR überschreiten -> Skalieren oder blockieren
-                # Versuche proportionale Skalierung: Reduziere Zielallokation
+                # Versuche zu skalieren
                 current_alloc = d.get("target_allocation", 0)
                 if current_alloc > 0.01:
-                    # Skalierungsfaktor: so dass neuer CVaR = Limit
-                    # Vereinfacht: linearer Zusammenhang (nicht exakt, aber gut genug)
-                    scale = (cvar_limit - cvar_state["cvar_pct"]) / trade_sim["cvar_change"] if trade_sim["cvar_change"] != 0 else 0
+                    # Vereinfachte lineare Skalierung
+                    scale = (cvar_limit - current_cvar) / (trade_sim["cvar_change"] + 1e-6)
                     scale = max(0, min(1, scale))
                     if scale > 0.3:
                         new_alloc = current_alloc * scale
@@ -701,16 +700,20 @@ class RiskManager:
             else:
                 approved.append(d)
 
-        # 4. CVaR-basiertes Position Sizing (Priorität 3) für alle BUYs
+        # 4. CVaR-basiertes Position Sizing für alle BUYs
         for d in approved:
             if d.get("action") == "BUY":
                 orig_alloc = d["target_allocation"]
+                max_pos = self.settings.get("max_position_pct", 0.20)
                 adjusted = self.cvar_manager.cvar_adjusted_allocation(
-                    orig_alloc, d["ticker"], positions, historical_returns
+                    orig_alloc, d["ticker"], positions, historical_returns, max_pos
                 )
                 if adjusted != orig_alloc:
                     d["target_allocation"] = round(adjusted, 4)
                     d["reason"] += f" [CVaR sizing: {orig_alloc:.1%} -> {adjusted:.1%}]"
                     log.info(f"CVaR sizing: {d['ticker']} {orig_alloc:.1%} -> {adjusted:.1%}")
 
-        return approved, [f"CVaR blocked {len(blocked)} BUYs"] if blocked else []
+        warnings = []
+        if blocked:
+            warnings.append(f"CVaR blocked {len(blocked)} BUYs")
+        return approved, warnings
