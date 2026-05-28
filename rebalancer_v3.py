@@ -164,7 +164,7 @@ class RebalancerV3:
         Identifiziert sinnvolle Swaps basierend auf Edge Differential.
         Rückgabe: Liste von (sell_ticker, buy_ticker, edge_gain)
         """
-        # Nur Assets mit significantem Unterschied
+        # Nur Assets mit signifikanter Differenz
         overweights = [(t, w) for t, w in current_weights.items() if w > target_weights.get(t, 0) + 0.02]
         underweights = [(t, w) for t, w in target_weights.items() if w > current_weights.get(t, 0) + 0.02]
         
@@ -203,6 +203,7 @@ class RebalancerV3:
         current_weights: Dict[str, float],
         target_weights: Dict[str, float],
         swaps: List[Tuple[str, str, float]],
+        edges: Dict[str, AssetEdge],   # edges wird benötigt für confidence
     ) -> List[Dict]:
         """
         Generiert Trades als Differenz zwischen Ziel und aktuell.
@@ -224,11 +225,13 @@ class RebalancerV3:
             if abs(delta) < 0.02:   # 2% Mindeständerung
                 continue
             action = "BUY" if delta > 0 else "SELL"
+            # Confidence aus edges, falls vorhanden
+            confidence = edges[ticker].confidence if ticker in edges else 0.7
             trades.append({
                 "ticker": ticker,
                 "action": action,
                 "target_allocation": target,
-                "confidence": edges[ticker].confidence if ticker in edges else 0.7,
+                "confidence": confidence,
                 "reason": f"Target weight {target:.1%} vs current {current:.1%}",
             })
         return trades
@@ -298,8 +301,8 @@ class RebalancerV3:
         # 3. Swaps identifizieren (Edge-basiert)
         swaps = self.identify_swaps(current_weights, target_weights, edges, regime)
         
-        # 4. Trades generieren
-        trades = self.generate_trades(current_weights, target_weights, swaps)
+        # 4. Trades generieren (edges wird übergeben)
+        trades = self.generate_trades(current_weights, target_weights, swaps, edges)
         
         # 5. Cash-Ziel
         total_target = sum(target_weights.values())
