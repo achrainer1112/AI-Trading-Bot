@@ -131,7 +131,7 @@ ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 CAPITAL_ROTATION_ENABLED = True
 CAPITAL_ROTATION_MIN_SCORE_DIFF = 15.0      # Mindest-Score-Differenz für Rotation
 CAPITAL_ROTATION_MAX_PER_RUN = 2            # Max. Rotationen pro Run
-CAPITAL_ROTATION_MIN_VALUE_USD = 100.0      # Mindestwert für Rotation
+CAPITAL_ROTATION_MIN_VALUE_USD = 50.0      # Mindestwert für Rotation
 CAPITAL_ROTATION_MIN_HOLD_DAYS = 5          # Position muss mind. 5 Tage gehalten sein
 
 # ─────────────────────────────────────────────
@@ -200,7 +200,7 @@ PORTFOLIO_HISTORY_FILE = "logs/portfolio_history.json"
 LOG_DIR = "logs"
 
 INITIAL_CAPITAL = 100_000.0
-MIN_ORDER_VALUE = 100.0
+MIN_ORDER_VALUE = 10.0
 
 # ─────────────────────────────────────────────
 # SCORE ENGINE
