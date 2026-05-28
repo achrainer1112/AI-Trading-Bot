@@ -1,15 +1,8 @@
 """
-AI Trading Bot - Hauptprogramm (Production)
-=============================================
-Korrekte Ausführungsreihenfolge:
-  Phase 0: Markt-Check → sofort abbrechen wenn geschlossen (Fix #1)
-  Phase 1: Zombie-Cleanup (Fix #3)
-  Phase 2: SELLs ausführen
-  Phase 3: Broker-Sync (echtes Cash nach SELLs)
-  Phase 4: BUYs mit korrekt berechnetem Cash ausführen
-  Phase 5: Portfolio-Konsistenz-Check (Fix #10)
-  Phase 6: Journal mit echten Fill-Daten
-  Phase 7: Capital Rotation (neu)
+AI Trading Bot - Hauptprogramm (Production) mit Portfolio Rebalancing Engine
+==============================================================
+Integriert die neue Portfolio Rebalancing Engine für ganzheitliche,
+transaktionskostenbewusste Portfolio-Optimierung.
 """
 
 import argparse
@@ -23,7 +16,7 @@ from config import (
     TRADING_MODE, FULL_WATCHLIST, ETF_WATCHLIST, STOCK_WATCHLIST,
     ACTIVE_RISK_PROFILE, RISK_SETTINGS, SCHEDULE_INTERVAL, SCHEDULE_TIME,
     BACKTEST_START_DATE, BACKTEST_END_DATE, INITIAL_CAPITAL,
-    LOG_DIR, CORRELATION_GROUPS,
+    LOG_DIR, CORRELATION_GROUPS, REBALANCING_ENGINE_ENABLED,
 )
 from data_collector import MarketDataCollector
 from news_collector import NewsCollector
@@ -43,6 +36,7 @@ from decision_filter import apply_decision_filter
 from execution_safety import LiveRunLogger, DrawdownMonitor
 from config import ALLOW_LIVE_TRADING, KILL_SWITCH_DRAWDOWN_PCT
 from capital_rotator import CapitalRotator
+from portfolio_rebalancer import PortfolioRebalancer, RebalancingDecision
 
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -51,6 +45,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 class TradingBot:
     """
     Orchestriert alle Module für den vollautomatischen Trading-Ablauf.
+    Verwendet jetzt die Portfolio Rebalancing Engine als zentrale Optimierungsinstanz.
     """
 
     def __init__(self, mode: str = None):
@@ -60,6 +55,7 @@ class TradingBot:
         log.info(f"  Modus: {self.mode} | Risikoprofil: {ACTIVE_RISK_PROFILE.value.upper()}")
         log.info(f"  Watchlist: {len(FULL_WATCHLIST)} Assets")
         log.info(f"  Markt-Status: {market_status()}")
+        log.info(f"  Rebalancing Engine: {'AKTIV' if REBALANCING_ENGINE_ENABLED else 'INAKTIV'}")
         log.info("=" * 70)
 
         self.data_collector = MarketDataCollector(FULL_WATCHLIST)
@@ -70,6 +66,9 @@ class TradingBot:
         alpaca_api = self.executor.api if self.mode in ("PAPER", "REAL", "LIVE") else None
         self.portfolio = PortfolioManager(mode=self.mode, alpaca_api=alpaca_api)
         self.risk_manager = RiskManager(ACTIVE_RISK_PROFILE)
+
+        # Neue Portfolio Rebalancing Engine
+        self.rebalancer = PortfolioRebalancer(ACTIVE_RISK_PROFILE)
 
         self._live_logger = LiveRunLogger()
         _guard = self.executor.get_guard()
@@ -138,7 +137,7 @@ class TradingBot:
         zombie_tickers = find_zombie_positions(self.portfolio.positions)
         zombie_orders = build_zombie_sell_orders(zombie_tickers, self.portfolio.positions)
 
-        # SCHRITT 4: KI-Analyse
+        # SCHRITT 4: KI-Analyse & Entscheidungsfindung
         log.info("\nSCHRITT 4/8: KI-Analyse & Entscheidungsfindung...")
         log.info("\nSCHRITT 3.5/8: Trailing Stop Check...")
         trailing_stops = self.portfolio.get_trailing_stop_triggers(market_data, trail_pct=0.12)
@@ -147,12 +146,58 @@ class TradingBot:
 
         effective_watchlist = list(set(FULL_WATCHLIST) | set(self.portfolio.positions.keys()))
 
+        # ScoreEngine für Scores, Momentum, Volatilität
+        from score_engine import ScoreEngine
+        score_engine = ScoreEngine(positions=self.portfolio.positions, total_value=portfolio_summary_before.get("total_value", 100_000))
+        spy_return = market_data.get("SPY", {}).get("return_20d")
+        scores_obj = score_engine.score_all(market_data, regime_state, spy_return)
+        scores = {ticker: sb.total_score for ticker, sb in scores_obj.items()}
+        momentum = {ticker: sb.momentum_20d or 0.0 for ticker, sb in scores_obj.items()}
+        volatility = {ticker: sb.volatility_annual or 20.0 for ticker, sb in scores_obj.items()}
+        current_weights = self.portfolio.get_allocations()
+        total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
+        cash = portfolio_summary_before.get("cash", 0.0)
+
+        # Portfolio Rebalancing Engine (neu)
+        rebalancing_decisions, target_weights, cash_target, rebalance_rationale = self.rebalancer.optimize_portfolio(
+            scores=scores,
+            market_data=market_data,
+            current_weights=current_weights,
+            cash=cash,
+            total_value=total_value,
+            regime_state=regime_state,
+        )
+
+        # Konvertiere Rebalancing-Entscheidungen in das alte Decision-Format für Kompatibilität
+        rebalancing_actions = []
+        for d in rebalancing_decisions:
+            rebalancing_actions.append({
+                "ticker": d.ticker,
+                "action": d.action,
+                "target_allocation": d.target_weight,
+                "confidence": d.confidence,
+                "reason": d.reason,
+                "risk_approved": True,
+                "rebalancing_engine": True,
+            })
+
+        # KI-Analyse (nutzt die Rebalancing-Vorschläge als Basis)
         ai_input_log = {"timestamp": start_time.isoformat(), "watchlist": effective_watchlist, "portfolio": portfolio_summary_before}
         save_json_file(f"{LOG_DIR}/ai_input_{start_time.strftime('%Y%m%d_%H%M%S')}.json", ai_input_log)
 
         recent_journal = journal.get_history()[-10:]
         if recent_journal:
             log.info(f"  Feedback-Loop: {len(recent_journal)} vergangene Runs geladen.")
+
+        # Wir übergeben die Rebalancing-Zielallokationen an die KI als "portfolio_allocation"
+        # Dazu bauen wir ein einfaches Dict (mock des PortfolioAllocation)
+        class MockAllocation:
+            def __init__(self, targets, cash_t, rationale):
+                self.target_allocations = targets
+                self.cash_target = cash_t
+                self.rationale = rationale
+                self.recommended_sells = []
+        mock_allocation = MockAllocation(target_weights, cash_target, rebalance_rationale)
 
         ai_result = self.ai_analyzer.analyze(
             portfolio_summary=portfolio_summary_before,
@@ -161,20 +206,29 @@ class TradingBot:
             watchlist=effective_watchlist,
             journal_entries=recent_journal,
             regime_state=regime_state,
+            portfolio_allocation=mock_allocation,
         )
         raw_decisions = [dict(d) for d in ai_result.get("decisions", [])]
+
+        # Mische KI-Entscheidungen mit den Rebalancing-Entscheidungen (Rebalancing hat höhere Priorität)
+        decision_map = {d["ticker"]: d for d in raw_decisions}
+        for rd in rebalancing_actions:
+            ticker = rd["ticker"]
+            if ticker in decision_map:
+                log.debug(f"Überschreibe KI-Entscheidung für {ticker} mit Rebalancing-Engine: {rd['action']}")
+            decision_map[ticker] = rd
+        merged_decisions = list(decision_map.values())
 
         # DecisionFilter
         log.info("\nSCHRITT 4b/8: Decision quality filter...")
         filtered_decisions, filter_warnings = apply_decision_filter(
-            decisions=raw_decisions,
+            decisions=merged_decisions,
             risk_settings=RISK_SETTINGS[ACTIVE_RISK_PROFILE],
             positions=self.portfolio.positions,
             total_value=portfolio_summary_before.get("total_value", 100_000),
             market_data=market_data,
             regime_state=regime_state,
         )
-        ai_result["decisions"] = filtered_decisions
         if filter_warnings:
             run_summary["decision_filter_warnings"] = filter_warnings
 
@@ -191,7 +245,7 @@ class TradingBot:
         for d in decisions:
             log.info(f"  → {d['action']:<5} {d['ticker']:<6} Allok: {d.get('target_allocation', 0):.0%} | Konfidenz: {d.get('confidence', 0):.0%}")
 
-        # SCHRITT 5: Stop-Loss + Zombie-Cleanup
+        # SCHRITT 5: Stop-Loss & Zombie-Cleanup
         log.info("\nSCHRITT 5/8: Stop-Loss & Zombie-Cleanup...")
         stop_loss_orders = self.risk_manager.check_stop_loss(self.portfolio.positions, market_data)
         decisions = stop_loss_orders + trailing_stops + zombie_orders + decisions
@@ -226,7 +280,7 @@ class TradingBot:
                 log.info(f"Small account: lowering min_trade_value from ${min_trade_value:.2f} to ${dynamic_min:.2f}")
                 min_trade_value = dynamic_min
 
-        # Rebalancing-Berechnung
+        # Rebalancing-Berechnung basierend auf validierten Entscheidungen
         planned_trades = self.portfolio.calculate_rebalancing_trades(
             target_allocations={
                 d["ticker"]: d.get("target_allocation", 0)
@@ -238,14 +292,14 @@ class TradingBot:
             min_trade_value=min_trade_value,
         )
 
-        # ===== CAPITAL ROTATION =====
+        # ===== CAPITAL ROTATION (optional) =====
         approved_buys = [d for d in validated if d.get("action") == "BUY" and d.get("risk_approved")]
         if approved_buys and total_value > 2000:
             rotator = CapitalRotator()
             cooldown_set = set(cooldown_manager._data.keys()) if hasattr(cooldown_manager, '_data') else set()
             rotation_candidates = rotator.find_rotation_candidates(
                 new_buy_tickers=[d['ticker'] for d in approved_buys],
-                new_scores=ai_result.get("scores", {}),
+                new_scores=scores,
                 current_positions=self.portfolio.positions,
                 total_value=total_value,
                 market_data=market_data,
@@ -276,55 +330,38 @@ class TradingBot:
                     decisions_map=decisions_map,
                     min_trade_value=min_trade_value,
                 )
-        # ===== ENDE CAPITAL ROTATION =====
 
         sell_trades = [t for t in planned_trades if t["action"] == "SELL"]
         buy_trades = [t for t in planned_trades if t["action"] == "BUY"]
 
-        # ===== DEBUG: Execution-Flags ausgeben =====
-        execution_enabled_raw = (
+        # Debug-Ausgaben
+        log.info(f"🔍 DEBUG: analysis_only={analysis_only}, mode={self.mode}, has_api={self.executor.api is not None}")
+        log.info(f"🔍 DEBUG: sell_trades count={len(sell_trades)}, buy_trades count={len(buy_trades)}")
+
+        execution_enabled = (
             not analysis_only
             and self.mode in ("PAPER", "REAL", "LIVE")
             and self.executor.api is not None
         )
-        log.info(f"🔍 DEBUG: analysis_only={analysis_only}, mode={self.mode}, has_api={self.executor.api is not None}")
-        log.info(f"🔍 DEBUG: execution_enabled_raw={execution_enabled_raw}")
-        log.info(f"🔍 DEBUG: sell_trades count={len(sell_trades)}, buy_trades count={len(buy_trades)}")
-
-        # Final Execution Guard (vor der Ausführung)
-        execution_enabled = execution_enabled_raw
 
         if execution_enabled:
-            # Guard-Validierung (bleibt wie bisher)
             _guard = self.executor.get_guard()
             if _guard:
                 md_ok = _guard.validate_market_data(market_data)
                 ai_ok = _guard.validate_ai_response(ai_result)
                 log.info(f"🔍 DEBUG: guard market_data_ok={md_ok}, ai_response_ok={ai_ok}")
                 if not md_ok or not ai_ok:
-                    log.critical(f"[PHASE 4A] Guard-Validierung fehlgeschlagen: market_data={md_ok} ai_response={ai_ok} → Execution deaktiviert.")
+                    log.critical(f"Guard-Validierung fehlgeschlagen -> Execution deaktiviert.")
                     execution_enabled = False
                     run_summary["errors"].append("guard_validation_failed")
-            else:
-                log.warning("🔍 DEBUG: Kein Guard-Objekt vorhanden – überspringe Guard-Prüfung.")
-
-            # Drawdown Kill-Switch
             if execution_enabled and self._drawdown_monitor:
                 _total = portfolio_summary_before.get("total_value", 0)
                 _peak = portfolio_summary_before.get("peak_value") or _total
-                killed = self._drawdown_monitor.check(
-                    portfolio_value=_total,
-                    peak_value=_peak,
-                    api=self.executor.api,
-                )
-                if killed:
-                    log.critical("[PHASE 4A] Drawdown Kill-Switch ausgelöst → Execution gestoppt.")
+                if self._drawdown_monitor.check(portfolio_value=_total, peak_value=_peak, api=self.executor.api):
+                    log.critical("Drawdown Kill-Switch ausgelöst -> Execution gestoppt.")
                     execution_enabled = False
                     run_summary["errors"].append("drawdown_kill_switch")
 
-        log.info(f"🔍 DEBUG: FINAL execution_enabled={execution_enabled}")
-
-        # Final Execution Guard (Anpassung der Trades)
         if execution_enabled:
             sell_trades, buy_trades, guard_warnings = self._final_execution_guard(
                 sell_trades, buy_trades, portfolio_summary_before
@@ -358,9 +395,9 @@ class TradingBot:
                     )
             run_summary["sells_executed"] = sells_ok
         else:
-            log.info("\n  ── Phase 1: SELL-Phase übersprungen (keine SELLs oder Execution disabled)")
+            log.info("\n  ── Phase 1: SELL-Phase übersprungen")
 
-        # Phase 2: Broker-Sync nach SELLs
+        # Phase 2: Broker-Sync
         if execution_enabled and sell_trades and self.mode in ("PAPER", "REAL", "LIVE") and self.executor.api:
             log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
             time.sleep(2)
@@ -410,7 +447,7 @@ class TradingBot:
                     )
             run_summary["buys_executed"] = buys_ok
         else:
-            log.info("\n  ── Phase 3: BUY-Phase übersprungen (keine BUYs oder Execution disabled)")
+            log.info("\n  ── Phase 3: BUY-Phase übersprungen")
 
         run_summary["trades_executed"] = sells_ok + buys_ok
         run_summary["execution_mode"] = "LIVE" if execution_enabled else "SIMULATED"
@@ -427,10 +464,10 @@ class TradingBot:
 
         real_executed = [r for r in executed_records if r.get("status") == "EXECUTED" or (r.get("fill_qty") or 0) > 0]
 
-        if ai_result.get("scores"):
-            top_scores = sorted(ai_result["scores"].values(), key=lambda x: x.get("total_score", 0), reverse=True)[:5]
-            log.info("  Top-5 Quant Scores: " + " | ".join(f"{s['ticker']}={s.get('total_score',0):.0f}({s.get('signal','')})" for s in top_scores))
-            save_json_file(f"{LOG_DIR}/scores_{start_time.strftime('%Y%m%d_%H%M%S')}.json", ai_result["scores"])
+        if scores_obj:
+            top_scores = sorted(scores_obj.values(), key=lambda x: x.total_score, reverse=True)[:5]
+            log.info("  Top-5 Quant Scores: " + " | ".join(f"{s.ticker}={s.total_score:.0f}({s.signal})" for s in top_scores))
+            save_json_file(f"{LOG_DIR}/scores_{start_time.strftime('%Y%m%d_%H%M%S')}.json", {t: sb.to_dict() for t, sb in scores_obj.items()})
 
         journal.log_run(
             market_outlook=ai_result.get("market_outlook", ""),
@@ -469,7 +506,7 @@ class TradingBot:
 
         return run_summary
 
-    # ─── PHASE 4: Final Execution Guard ──────────────────────────────────────
+    # ─── Final Execution Guard ────────────────────────────────────────────────
     def _final_execution_guard(self, sell_trades: List[Dict], buy_trades: List[Dict], portfolio_summary: Dict) -> Tuple[List[Dict], List[Dict], List[str]]:
         warnings = []
         _profile = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
