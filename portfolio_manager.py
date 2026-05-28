@@ -412,152 +412,59 @@ class PortfolioManager:
         target_allocations: Dict[str, float],
         current_prices: Dict[str, float],
         decisions_map: Dict[str, Dict] = None,
-        min_trade_value: float = 100.0,
+        min_trade_value: float = 10.0,   # jetzt nur noch "execution safety floor"
     ) -> List[Dict]:
         """
-        Berechnet die notwendigen Trades, um Ziel-Allokationen zu erreichen.
-        Dynamische Mindestordergröße für kleine Konten.
+        Berechnet Trades basierend auf Zielallokationen.
+        min_trade_value ist nur ein Sicherheits-Floor, nicht die primäre Logik.
         """
         decisions_map = decisions_map or {}
         total_value = self.get_total_value()
         current_allocs = self.get_allocations()
         trades = []
 
-        # Dynamische Mindestordergröße für kleine Konten
-        from config import RISK_SETTINGS, ACTIVE_RISK_PROFILE
-        _profile_settings = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
-        min_trade_value = _profile_settings.get("min_trade_value", 100.0)
-        if total_value < 10000:
-            min_trade_value = max(10.0, total_value * 0.05)
-            log.info(f"Small account: adjusted min_trade_value to ${min_trade_value:.2f}")
+        # Dynamische Mindestordergröße als Prozentsatz (0.5% des Portfolios, aber mindestens 10 USD)
+        min_trade_abs = max(10.0, total_value * 0.005)
 
         for ticker, target_alloc in target_allocations.items():
             if ticker == "CASH":
                 continue
 
             price = current_prices.get(ticker)
-            decision = decisions_map.get(ticker, {})
-            is_zombie_sell = (decision.get("zombie_cleanup", False) or decision.get("orphan", False)) and decision.get("action") == "SELL"
-
             if not price or price <= 0:
-                in_portfolio_check = ticker in self.positions
-                ai_action_check = decisions_map.get(ticker, {}).get("action", "HOLD")
-                ai_conf_check = decisions_map.get(ticker, {}).get("confidence", 0)
-
-                if is_zombie_sell:
-                    log.info(f"Zombie SELL {ticker}: kein Marktpreis → force_close")
-                    trades.append({
-                        "ticker": ticker,
-                        "action": "SELL",
-                        "value": 0.0,
-                        "quantity": self.positions.get(ticker, {}).get("quantity", 0),
-                        "price": 0.0,
-                        "current_alloc": 0.0,
-                        "target_alloc": 0.0,
-                        "ai_reason": decision.get("reason", "Zombie liquidation"),
-                        "ai_confidence": 1.0,
-                        "zombie_cleanup": True,
-                    })
-                    continue
-
-                if in_portfolio_check and ai_action_check == "SELL" and ai_conf_check >= 0.60:
-                    pos_qty = self.positions[ticker].get("qty_available", self.positions[ticker].get("quantity", 0))
-                    avg_px = self.positions[ticker].get("avg_price", 0)
-                    log.warning(f"SELL {ticker}: kein Marktpreis, nutze Ø-Kaufpreis ${avg_px:.2f}")
-                    est_value = pos_qty * avg_px
-                    trades.append({
-                        "ticker": ticker,
-                        "action": "SELL",
-                        "quantity": round(pos_qty, 6),
-                        "price": avg_px,
-                        "value": round(est_value, 2),
-                        "current_alloc": self.positions[ticker].get("market_value", 0) / max(self.get_total_value(), 1),
-                        "target_alloc": 0.0,
-                        "diff_value": round(-est_value, 2),
-                        "ai_action": "SELL",
-                        "ai_reason": decision.get("reason", "Portfolio Rebalancing"),
-                        "ai_confidence": ai_conf_check,
-                        "price_estimated": True,
-                    })
-                    continue
-
                 log.warning(f"Kein Preis für {ticker}, überspringe.")
                 continue
 
-            in_portfolio = ticker in self.positions
-            target_value = total_value * target_alloc
             current_value = self.positions.get(ticker, {}).get("market_value", 0)
+            target_value = total_value * target_alloc
             diff_value = target_value - current_value
-            current_alloc = current_allocs.get(ticker, 0)
 
-            ai_action = decision.get("action", "HOLD")
-            ai_reason = decision.get("reason", "Portfolio Rebalancing")
-            ai_confidence = decision.get("confidence", 0)
-
-            if ai_action == "SELL" and not in_portfolio:
-                log.info(f"{ticker}: KI sagt SELL aber keine Position -> übersprungen")
-                continue
-
-            is_explicit_liquidation = (
-                target_alloc == 0.0 and in_portfolio and ai_action == "SELL" and
-                (decision.get("orphan", False) or decision.get("stop_loss", False) or
-                 decision.get("rebalancing", False) or ai_confidence >= 0.80)
-            )
-            if target_alloc == 0.0 and in_portfolio and not is_explicit_liquidation:
-                log.debug(f"{ticker}: target=0% aber kein Liquidationssignal -> Soft Rebalancing übersprungen")
-                continue
-
-            if ai_action == "SELL" and target_alloc == 0.0 and in_portfolio:
-                available_qty = self.positions[ticker].get("qty_available", self.positions[ticker]["quantity"])
-                sell_value = available_qty * price
-                trades.append({
-                    "ticker": ticker, "action": "SELL", "quantity": round(available_qty, 6), "price": price,
-                    "value": round(sell_value, 2), "current_alloc": round(current_alloc, 4), "target_alloc": 0.0,
-                    "diff_value": round(-sell_value, 2), "ai_action": "SELL", "ai_reason": ai_reason,
-                    "ai_confidence": ai_confidence, "decision_id": decision.get("decision_id"),
-                })
-                log.info(f"{ticker}: SELL-Aktion mit 0% Zielallokation → vollständige Liquidation")
-                continue
-
-            alloc_drift = abs(current_alloc - target_alloc)
-            if ai_action == "BUY" and target_alloc > 0:
-                if alloc_drift < 0.01:
-                    log.debug(f"{ticker}: BUY-Drift {alloc_drift:.1%} < 1% -> übersprungen")
-                    continue
-
-            # Dynamische Mindestordergröße: kleine Differenz auf Mindestwert aufrunden
-            if abs(diff_value) < min_trade_value:
-                if ai_action == "BUY" and decision.get("risk_approved", False) and diff_value > 0:
-                    log.info(f"{ticker}: BUY-Differenz ${diff_value:.2f} unter Mindestwert ${min_trade_value:.2f} -> aufrunden")
-                    diff_value = min_trade_value
-                    target_value = current_value + diff_value
-                    target_alloc = target_value / total_value
-                else:
-                    log.debug(f"{ticker}: Differenz ${diff_value:.2f} unter Mindestwert, überspringe.")
+            if abs(diff_value) < min_trade_abs:
+                # nur loggen, nicht ignorieren – aber trotzdem Trade generieren,
+                # wenn die relative Abweichung signifikant ist (> 2% des Portfolios)
+                if abs(target_alloc - current_allocs.get(ticker, 0)) < 0.02:
                     continue
 
             action = "BUY" if diff_value > 0 else "SELL"
-
-            if action == "SELL":
-                available_qty = self.positions.get(ticker, {}).get("qty_available", self.positions.get(ticker, {}).get("quantity", 0))
-                needed_qty = abs(diff_value) / price
-                sell_qty = round(min(needed_qty, available_qty), 6)
-                if sell_qty <= 0:
-                    continue
-                quantity = sell_qty
-                actual_value = round(quantity * price, 2)
-            else:
-                quantity = abs(diff_value) / price
-                actual_value = round(abs(diff_value), 2)
+            quantity = abs(diff_value) / price
+            actual_value = abs(diff_value)
 
             trades.append({
-                "ticker": ticker, "action": action, "quantity": round(quantity, 6), "price": price,
-                "value": actual_value, "current_alloc": round(current_alloc, 4), "target_alloc": round(target_alloc, 4),
-                "diff_value": round(diff_value, 2), "ai_action": ai_action, "ai_reason": ai_reason,
-                "ai_confidence": ai_confidence, "decision_id": decision.get("decision_id"),
+                "ticker": ticker,
+                "action": action,
+                "quantity": round(quantity, 6),
+                "price": price,
+                "value": round(actual_value, 2),
+                "current_alloc": round(current_allocs.get(ticker, 0), 4),
+                "target_alloc": round(target_alloc, 4),
+                "diff_value": round(diff_value, 2),
+                "ai_action": decisions_map.get(ticker, {}).get("action", action),
+                "ai_reason": decisions_map.get(ticker, {}).get("reason", ""),
+                "ai_confidence": decisions_map.get(ticker, {}).get("confidence", 0.7),
+                "decision_id": decisions_map.get(ticker, {}).get("decision_id"),
             })
-            log.debug(f"Rebalancing {ticker}: {action} ${actual_value:.0f} ({current_alloc*100:.1f}% -> {target_alloc*100:.1f}%)")
 
+        # SELLs zuerst
         trades.sort(key=lambda t: 0 if t["action"] == "SELL" else 1)
         return trades
 
