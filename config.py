@@ -26,7 +26,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# RISIKOPROFILE (unverändert)
+# RISIKOPROFILE
 # ─────────────────────────────────────────────
 class RiskProfile(Enum):
     CONSERVATIVE = "conservative"
@@ -102,7 +102,7 @@ RISK_SETTINGS = {
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 
 # ─────────────────────────────────────────────
-# REGIME-AWARE RISK ENGINE (NEU)
+# REGIME-AWARE RISK ENGINE
 # ─────────────────────────────────────────────
 REGIME_CONFIDENCE_THRESHOLDS = {
     "BULL": {
@@ -128,7 +128,7 @@ VOLATILITY_MULTIPLIERS = {
 
 MOMENTUM_BOOST_ENABLED = True
 MOMENTUM_BOOST_FACTOR = 1.2
-MOMENTUM_STRENGTH_THRESHOLD = 10.0  # in Prozent (10% Momentum)
+MOMENTUM_STRENGTH_THRESHOLD = 10.0
 
 CORRELATION_CLUSTERS = [
     {"name": "mega_tech", "tickers": ["AAPL", "MSFT", "NVDA", "AMD", "QQQ", "XLK"]},
@@ -151,7 +151,7 @@ CASH_TARGET_BY_REGIME = {
 }
 
 # ─────────────────────────────────────────────
-# WEITERE KONSTANTEN (unverändert)
+# WATCHLIST & ETFs
 # ─────────────────────────────────────────────
 ETF_WATCHLIST = ["SPY", "QQQ", "VT"]
 SECTOR_ETFS = ["XLV", "XLF", "XLE", "XLK"]
@@ -164,6 +164,11 @@ SECTOR_CLASSIFICATION = {
     "V": "financial", "MA": "financial", "JPM": "financial",
     "XLV": "healthcare", "XLF": "financial", "XLE": "energy",
     "SPY": "diversified", "VT": "diversified",
+}
+
+FACTOR_CLASSIFICATION = {
+    "QQQ": "tech", "XLK": "tech", "XLV": "healthcare", "XLF": "financial",
+    "XLE": "energy", "SPY": "diversified", "VT": "diversified",
 }
 
 CORRELATION_GROUPS = [
@@ -181,6 +186,7 @@ ETF_SECTOR_WEIGHTS = {
     "XLF": {"financial": 0.80, "diversified": 0.20},
     "XLE": {"energy": 0.80, "diversified": 0.20},
 }
+ETF_FACTOR_WEIGHTS = ETF_SECTOR_WEIGHTS
 
 # ─────────────────────────────────────────────
 # PORTFOLIO EINSTELLUNGEN
@@ -189,6 +195,7 @@ PORTFOLIO_FILE = "portfolio.json"
 TRADE_LOG_FILE = "logs/trades.json"
 PORTFOLIO_HISTORY_FILE = "logs/portfolio_history.json"
 LOG_DIR = "logs"
+
 INITIAL_CAPITAL = 100_000.0
 MIN_ORDER_VALUE = 10.0
 
