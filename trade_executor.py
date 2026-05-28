@@ -1,14 +1,6 @@
 """
 trade_executor.py – Phase 4A: Live Trading Safety Layer + Retry Logic
 ========================================================
-Änderungen gegenüber der PAPER-Version:
-  - ExecutionGate: assert_order_allowed() vor jeder Order
-  - IdempotencyStore: doppelte Orders verhindern
-  - CapitalSafetyChecker: Cash-Buffer & Position-Cap erzwingen
-  - Order Status Validation: rejected / partial fill / delayed execution handling
-  - Retry Logic: automatische Wiederholung bei temporären Fehlern (Rate Limit, Network)
-  - LIVE Mode: echte Alpaca-Submission (notional für BUY, qty für SELL)
-  - DRY Mode: nur noch für lokale Tests, nie im Produktionsbetrieb
 """
 
 from __future__ import annotations
@@ -66,7 +58,6 @@ class TradeExecutor:
         self.api: Optional[tradeapi.REST] = None
         self._deduplicator = TradeDeduplicator()
 
-        # Phase 4A: Safety-Objekte
         self._idempotency = IdempotencyStore()
         self._capital_checker = CapitalSafetyChecker(
             min_cash_pct=_profile["min_cash_pct"],
@@ -78,9 +69,6 @@ class TradeExecutor:
 
         log.info(f"Trade Executor initialisiert | Modus: {self.mode}")
 
-    # ─────────────────────────────
-    # CONNECT
-    # ─────────────────────────────
     def _connect(self):
         if not ALPACA_AVAILABLE:
             if self.mode == "LIVE":
@@ -108,9 +96,6 @@ class TradeExecutor:
             self.mode = "DRY"
             self.api = None
 
-    # ─────────────────────────────
-    # GUARD INITIALISIERUNG
-    # ─────────────────────────────
     def _init_guard(self):
         try:
             self._guard = LiveTradingGuard(
@@ -132,13 +117,7 @@ class TradeExecutor:
     def get_drawdown_monitor(self, limit_pct: float = 0.08) -> DrawdownMonitor:
         return DrawdownMonitor(self._guard, limit_pct=limit_pct)
 
-    # ─────────────────────────────
-    # RETRY DECORATOR LOGIC
-    # ─────────────────────────────
     def _submit_with_retry(self, order_func, max_retries: int = 3, base_delay: float = 1.0):
-        """
-        Führt order_func aus, wiederholt bei transienten Fehlern (Rate Limit, Timeout).
-        """
         last_exception = None
         for attempt in range(max_retries):
             try:
@@ -146,19 +125,17 @@ class TradeExecutor:
             except Exception as e:
                 last_exception = e
                 error_msg = str(e).lower()
-                # Nur bei transienten Fehlern wiederholen
                 if 'rate limit' in error_msg or 'too many requests' in error_msg or 'timeout' in error_msg or 'connection' in error_msg:
                     wait = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
                     log.warning(f"Transienter Fehler (Versuch {attempt+1}/{max_retries}): {e}. Warte {wait:.1f}s")
                     time.sleep(wait)
                     continue
                 else:
-                    # Nicht transienter Fehler -> sofort abbrechen
                     raise
         raise last_exception
 
     # ─────────────────────────────
-    # BUY
+    # BUY (mit Debug-Logs)
     # ─────────────────────────────
     def execute_buy(
         self,
@@ -172,22 +149,31 @@ class TradeExecutor:
         current_position_value: float = 0.0,
     ) -> Tuple[bool, Dict]:
 
-        if not is_market_open():
+        log.info(f"🔍 [EXECUTOR] execute_buy called: {ticker}, target_value={target_value}, price={current_price}, available_cash={available_cash}")
+
+        market_open = is_market_open()
+        log.info(f"🔍 [EXECUTOR] is_market_open() = {market_open}")
+
+        if not market_open:
+            log.warning(f"Market closed: BUY {ticker} skipped")
             return False, self._skipped(ticker, "BUY", reason, "market_closed")
 
         if current_price <= 0:
+            log.warning(f"Invalid price {current_price} for {ticker}")
             return False, self._skipped(ticker, "BUY", reason, "invalid_price")
 
         spendable = max(0, available_cash - min_cash_reserve)
         value = min(target_value, spendable)
 
         if value < MIN_ORDER_VALUE:
+            log.warning(f"Value ${value:.2f} < MIN_ORDER_VALUE ${MIN_ORDER_VALUE:.2f}")
             return False, self._skipped(ticker, "BUY", reason, "insufficient_cash")
 
         qty = Decimal(str(value)) / Decimal(str(current_price))
         qty = qty.quantize(QTY_PRECISION, rounding=ROUND_DOWN)
 
         if qty <= MIN_QTY:
+            log.warning(f"Qty {qty} <= MIN_QTY")
             return False, self._skipped(ticker, "BUY", reason, "qty_too_small")
 
         exec_id = IdempotencyStore.generate_id(ticker, "BUY", value)
@@ -219,10 +205,14 @@ class TradeExecutor:
         record = self._base_record(ticker, "BUY", float(qty), value, current_price, reason, trade_id)
         record["execution_id"] = exec_id
 
+        log.info(f"🔍 [EXECUTOR] Dispatching BUY order for {ticker}: qty={qty}, notional={value}")
         ok, record = self._dispatch(record, qty=qty, notional=value)
 
         if ok:
             self._idempotency.register(exec_id)
+            log.info(f"✅ [EXECUTOR] BUY order for {ticker} executed successfully")
+        else:
+            log.error(f"❌ [EXECUTOR] BUY order for {ticker} failed: {record.get('status')} - {record.get('reject_reason', '')}")
 
         return ok, record
 
@@ -238,6 +228,8 @@ class TradeExecutor:
         reason: str = "",
         full_liquidation: bool = False,
     ) -> Tuple[bool, Dict]:
+
+        log.info(f"🔍 [EXECUTOR] execute_sell called: {ticker}, target_value={target_value}, price={current_price}")
 
         if not is_market_open():
             return False, self._skipped(ticker, "SELL", reason, "market_closed")
@@ -283,12 +275,8 @@ class TradeExecutor:
 
         return ok, record
 
-    # ─────────────────────────────
-    # FORCE CLOSE (Zombie)
-    # ─────────────────────────────
     def _force_close_position(self, ticker: str, current_price: float, reason: str) -> Tuple[bool, Dict]:
         log.info(f"[FORCE CLOSE] {ticker}: Zombie-Rest via close_position() liquidieren")
-
         record = self._base_record(ticker, "SELL", 0.0, 0.0, current_price, reason,
                                    generate_trade_id(ticker, "FORCE_CLOSE", current_price))
         record["mode"] = self.mode
@@ -326,21 +314,14 @@ class TradeExecutor:
         self._log_trade_if_valid(record)
         return True, record
 
-    # ─────────────────────────────
-    # DISPATCH (mit Retry)
-    # ─────────────────────────────
     def _dispatch(self, record: Dict, qty=None, notional=None):
         record["mode"] = self.mode
         log.debug(f"[DISPATCH] {record['ticker']} {record['action']} | qty={qty} notional={notional}")
 
         if self.mode == "DRY":
             return self._run_dry(record, qty, notional)
-
         return self._run_broker(record, qty, notional)
 
-    # ─────────────────────────────
-    # DRY RUN
-    # ─────────────────────────────
     def _run_dry(self, record, qty, notional):
         slippage = random.uniform(-0.001, 0.001)
         price = record.get("price") or 100
@@ -352,9 +333,6 @@ class TradeExecutor:
         self._log_trade_if_valid(record)
         return True, record
 
-    # ─────────────────────────────
-    # BROKER (mit Retry)
-    # ─────────────────────────────
     def _run_broker(self, record, qty, notional):
         if not self.api:
             return self._run_dry(record, qty, notional)
@@ -378,9 +356,11 @@ class TradeExecutor:
                 )
 
         try:
+            log.info(f"🔍 [BROKER] Submitting {record['action']} order for {record['ticker']}, notional={notional}, qty={qty}")
             order = self._submit_with_retry(submit_order, max_retries=3)
+            log.info(f"🔍 [BROKER] Order submitted: id={order.id}")
         except Exception as e:
-            log.error(f"ORDER REJECTED (after retries): {record['ticker']} {record['action']} → {e}")
+            log.error(f"ORDER REJECTED: {record['ticker']} {record['action']} → {e}")
             record["status"] = STATUS_REJECTED
             record["reject_reason"] = str(e)
             return False, record
@@ -429,9 +409,6 @@ class TradeExecutor:
         self._log_trade_if_valid(record)
         return True, record
 
-    # ─────────────────────────────
-    # FILL WAIT (mit Timeout)
-    # ─────────────────────────────
     def _wait_for_fill(self, order_id: str, max_attempts: int = 20, interval: float = 1.5):
         terminal = {"filled", "rejected", "canceled", "partially_filled", "expired"}
         for attempt in range(max_attempts):
@@ -446,9 +423,6 @@ class TradeExecutor:
         log.warning(f"[FILL TIMEOUT] order_id={order_id} nach {max_attempts} Versuchen nicht terminal")
         return None
 
-    # ─────────────────────────────
-    # LOGGING
-    # ─────────────────────────────
     def _log_trade_if_valid(self, record: Dict):
         if record.get("status") != STATUS_EXECUTED:
             return
@@ -456,9 +430,6 @@ class TradeExecutor:
             return
         trade_logger.log_trade(record)
 
-    # ─────────────────────────────
-    # HELPERS
-    # ─────────────────────────────
     def _base_record(self, ticker, action, qty, value, price, reason, trade_id):
         return {
             "trade_id": trade_id,
