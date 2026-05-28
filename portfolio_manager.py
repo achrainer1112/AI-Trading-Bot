@@ -1,532 +1,683 @@
 """
-AI Trading Bot - Portfolio Manager
-====================================
-Verwaltet das lokale Portfolio: Positionen, Cash, Rebalancing-Berechnung.
-Speichert und lädt Daten aus portfolio.json.
+AI Trading Bot - Risk Manager (Production)
+============================================
+Erweiterte Risikokontrollen:
 
-Modi:
-- DRY:   Liest portfolio.json nur, schreibt NIE (read-only)
-- PAPER: Synchronisiert Positionen direkt von Alpaca (immer aktuell)
-- REAL:  Wie PAPER, aber mit echtem Geld
-
-FIXES (Production-grade):
-  FIX 1 – SINGLE SOURCE OF TRUTH: Alpaca ist Master, keine eigene Positionsschätzung
-  FIX 2 – PRE-TRADE VALIDATION: qty_available vom Broker, Cash final gecheckt
-  FIX 3 – SOFT REBALANCING: 2% Drift-Schwelle, kein Hard Reset auf 0%
-  FIX 4 – 2-PHASE EXECUTION: sync_from_broker() nach SELL-Phase aufrufen
-  NEU  – Dynamische Mindestordergröße für kleine Konten (5% des Portfolios, min $10)
+- Circuit Breaker (Intraday Loss, Drawdown, VIX, Market Halt)
+- Emergency Cash Mode (bei Überschreitung des maximalen Tagesverlusts)
+- VaR (Value at Risk) Berechnung und Limit
+- Volatility Targeting
+- Drawdown Protection
+- Dynamische Max-Trades (basierend auf VIX)
+- Sektor- und Faktor-Exposure Limits
+- Stop-Loss mit ATR-Option
+- Idempotente Entscheidungsauflösung
+- REGIME-AWARE Confidence Thresholds (neu)
 """
 
-import copy
-import json
-import os
-import time
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Set, Tuple
+from logger import log
+from config import (
+    ACTIVE_RISK_PROFILE,
+    RISK_SETTINGS,
+    RiskProfile,
+    SECTOR_CLASSIFICATION,
+    FACTOR_CLASSIFICATION,
+    ETF_SECTOR_WEIGHTS,
+    ETF_FACTOR_WEIGHTS,
+    REGIME_CONFIDENCE_THRESHOLDS,
+)
+from utils import format_currency, zombie_registry, ensure_decision_ids
 
-from logger import log, trade_logger
-from config import PORTFOLIO_FILE, INITIAL_CAPITAL
-from utils import save_json_file, load_json_file, format_currency, pct_change
+ETF_OVERLAP_GROUPS = [
+    {"SPY", "VTI", "IVV", "VOO"},
+    {"QQQ", "QQQM"},
+]
 
+TOP_N_BUYS = 5
 
-@dataclass
-class Position:
-    """Repräsentiert eine einzelne Portfolio-Position."""
-    ticker: str
-    quantity: float
-    avg_price: float
-    current_price: float
-    market_value: float
-    cost_basis: float
-    unrealized_pnl: float
-    unrealized_pnl_pct: float
-    allocation_pct: float
-    last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
+# ─────────────────────────────────────────────────────────────
+# CIRCUIT BREAKER SYSTEM
+# ─────────────────────────────────────────────────────────────
 
-
-class PortfolioManager:
+class CircuitBreaker:
     """
-    Verwaltet das lokale Portfolio.
-
-    mode="DRY"   -> portfolio.json nur lesen, nie schreiben
-    mode="PAPER" -> Positionen von Alpaca laden (live sync)
-    mode="REAL"  -> Positionen von Alpaca laden (live sync, echtes Geld)
-    """
-
-    # FIX 3: Soft Rebalancing – nur handeln wenn Allokations-Drift > Schwelle
-    DRIFT_THRESHOLD = 0.02  # 2% – vermeidet Stress-Trading bei kleinen Abweichungen
-
-    def __init__(
-        self,
-        portfolio_file: str = PORTFOLIO_FILE,
-        initial_capital: float = INITIAL_CAPITAL,
-        mode: str = "DRY",
-        alpaca_api=None,
-    ):
-        self.portfolio_file = portfolio_file
-        self.initial_capital = initial_capital
-        self.mode = mode.upper()
-        self.alpaca_api = alpaca_api
-        self.positions: Dict[str, Dict] = {}
-        self.cash: float = initial_capital
-        self.read_only = (self.mode == "DRY")
-
-        if self.mode in ("PAPER", "REAL", "LIVE") and self.alpaca_api:
-            try:
-                self._load_from_alpaca()
-            except Exception as e:
-                log.warning(f"Alpaca init fehlgeschlagen -> fallback local: {e}")
-                self.load()
-        else:
-            self.load()
-
-    # --- Laden & Speichern ---------------------------------------------------
-
-    def load(self):
-        """Ladet Portfolio aus JSON-Datei (DRY Modus: nur lesen)."""
-        data = load_json_file(self.portfolio_file, default=None)
-        if data is None:
-            log.info(f"Kein Portfolio gefunden, starte mit ${self.initial_capital:,.0f} Cash.")
-            self.positions = {}
-            self.cash = self.initial_capital
-            if not self.read_only:
-                self.save()
-        else:
-            self.positions = data.get("positions", {})
-            self.cash = data.get("cash", self.initial_capital)
-
-            if self.read_only:
-                log.info("[DRY MODE] Portfolio geladen (read-only)")
-            mode_hint = " [READ-ONLY, keine Aenderungen]" if self.read_only else ""
-            log.info(f"Portfolio geladen: {len(self.positions)} Positionen, "
-                     f"{format_currency(self.cash)} Cash{mode_hint}.")
-
-    def save(self):
-        if self.read_only:
-            log.debug("DRY MODE: save skipped")
-            return
-
-        save_json_file(self.portfolio_file, {
-            "cash": self.cash,
-            "positions": self.positions,
-            "last_updated": datetime.now().isoformat()
-        })
-
-    def _load_from_alpaca(self):
-        """
-        FIX 1 – SINGLE SOURCE OF TRUTH:
-        Laedt Positionen und Cash direkt von Alpaca.
-        """
-        try:
-            account = self.alpaca_api.get_account()
-            self.cash = float(account.cash)
-
-            local_data = load_json_file(self.portfolio_file, default=None)
-            if local_data and "initial_capital" in local_data:
-                self.initial_capital = local_data["initial_capital"]
-            else:
-                self.initial_capital = float(account.portfolio_value)
-
-            positions = self.alpaca_api.list_positions()
-            self.positions = {}
-            for pos in positions:
-                ticker = pos.symbol
-                qty_available = getattr(pos, "qty_available", None)
-                if qty_available is None:
-                    qty_available = pos.qty
-                qty_available = float(qty_available)
-                qty_total = float(pos.qty)
-                avg_price = float(pos.avg_entry_price)
-                current_price = float(pos.current_price)
-                market_value = float(pos.market_value)
-                cost_basis = float(pos.cost_basis)
-                unrealized_pnl = float(pos.unrealized_pl)
-                unrealized_pnl_pct = float(pos.unrealized_plpc) * 100
-
-                self.positions[ticker] = {
-                    "ticker": ticker,
-                    "quantity": qty_total,
-                    "qty_available": qty_available,
-                    "avg_price": avg_price,
-                    "current_price": current_price,
-                    "market_value": market_value,
-                    "cost_basis": cost_basis,
-                    "unrealized_pnl": unrealized_pnl,
-                    "unrealized_pnl_pct": unrealized_pnl_pct,
-                    "entry_date": datetime.now().isoformat(),
-                    "last_updated": datetime.now().isoformat(),
-                }
-
-            log.info(
-                f"[BROKER SYNC] Portfolio von Alpaca geladen: "
-                f"{len(self.positions)} Positionen, {format_currency(self.cash)} Cash."
-            )
-            self.save()
-
-        except Exception as e:
-            log.warning(f"Alpaca Portfolio-Sync fehlgeschlagen: {e} – lade lokales Portfolio.")
-            self.load()
-
-    def sync_from_broker(self) -> bool:
-        """Expliziter Broker-Sync nach der SELL-Phase."""
-        if not self.alpaca_api or self.mode not in ("PAPER", "REAL", "LIVE"):
-            log.debug("Broker-Sync nicht noetig (DRY Modus).")
-            return False
-        try:
-            time.sleep(2.0)
-            self._load_from_alpaca()
-            log.info("[BROKER SYNC] Portfolio nach SELL-Phase resynchronisiert.")
-            return True
-        except Exception as e:
-            log.warning(f"Broker-Sync fehlgeschlagen: {e}")
-            return False
-
-    # --- Portfolio-Zustand ---------------------------------------------------
-
-    def update_prices(self, market_data: Dict[str, Dict]):
-        """Aktualisiert aktuelle Preise aller Positionen aus Marktdaten."""
-        for ticker, pos in self.positions.items():
-            if ticker in market_data:
-                price = market_data[ticker].get("current_price")
-                if price:
-                    pos["current_price"] = price
-                    pos["market_value"] = pos["quantity"] * price
-                    pos["unrealized_pnl"] = pos["market_value"] - pos["cost_basis"]
-                    pos["unrealized_pnl_pct"] = pct_change(pos["cost_basis"], pos["market_value"])
-                    pos["last_updated"] = datetime.now().isoformat()
-        log.debug("Portfoliopreise aktualisiert.")
-
-    def get_total_value(self) -> float:
-        invested = sum(p.get("market_value", 0) for p in self.positions.values())
-        return self.cash + invested
-
-    def get_invested_value(self) -> float:
-        return sum(p.get("market_value", 0) for p in self.positions.values())
-
-    def get_allocations(self) -> Dict[str, float]:
-        total = self.get_total_value()
-        if total == 0:
-            return {}
-        allocs = {"CASH": self.cash / total}
-        for ticker, pos in self.positions.items():
-            allocs[ticker] = pos.get("market_value", 0) / total
-        return allocs
-
-    def get_summary(self) -> Dict:
-        total = self.get_total_value()
-        invested = self.get_invested_value()
-        total_pnl = sum(p.get("unrealized_pnl", 0) for p in self.positions.values())
-        pnl_pct = pct_change(self.initial_capital, total) if total > 0 else 0
-        allocs = self.get_allocations()
-        for ticker, pos in self.positions.items():
-            pos["allocation_pct"] = round(allocs.get(ticker, 0.0) * 100, 2)
-        return {
-            "total_value": round(total, 2),
-            "cash": round(self.cash, 2),
-            "cash_pct": round(self.cash / total * 100, 2) if total else 0,
-            "invested": round(invested, 2),
-            "initial_capital": self.initial_capital,
-            "unrealized_pnl": round(total_pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "n_positions": len(self.positions),
-            "positions": self.positions,
-            "mode": self.mode,
-        }
-
-    # ─── TRAILING STOP SYSTEM ──────────────────────────────────────────────────
+    Portfolio-level stress detection and automatic trading halts.
     
-    def get_trailing_stop_triggers(
+    Triggers:
+      - CB1: Intraday loss > 5% → STOP_ALL_BUYS (allow SELL only)
+      - CB2: Portfolio drawdown > 10% → REDUCE_EXPOSURE (50% smaller sizes)
+      - CB3: VIX spike > 35 → DE_RISK_50 (close 50% of long positions)
+      - CB4: Market halted → HALT_ALL (no trades)
+    """
+    
+    def __init__(self):
+        self.triggered = False
+        self.reason = None
+        self.action = None
+    
+    def check_all(self, portfolio: Dict, market_data: Dict) -> bool:
+        """Check all circuit breaker conditions. Returns True if ANY breaker is triggered."""
+        # CB1: Intraday Loss
+        intraday_loss = market_data.get('intraday_loss_pct', 0.0)
+        if intraday_loss < -0.05:
+            self.triggered = True
+            self.reason = f"Intraday loss: {intraday_loss:.2%} < -5%"
+            self.action = 'STOP_ALL_BUYS'
+            log.critical(f"🛑 CIRCUIT BREAKER 1 (Intraday Loss): {self.reason}")
+            return True
+        
+        # CB2: Portfolio Drawdown (peak to current)
+        drawdown = portfolio.get('drawdown_pct', 0.0)
+        if drawdown < -0.10:
+            self.triggered = True
+            self.reason = f"Portfolio drawdown: {drawdown:.2%} < -10%"
+            self.action = 'REDUCE_EXPOSURE'
+            log.critical(f"🛑 CIRCUIT BREAKER 2 (Drawdown): {self.reason}")
+            return True
+        
+        # CB3: VIX Spike
+        vix = market_data.get('vix', 20.0)
+        if vix > 35:
+            self.triggered = True
+            self.reason = f"VIX spike: {vix:.1f} > 35"
+            self.action = 'DE_RISK_50'
+            log.critical(f"🛑 CIRCUIT BREAKER 3 (VIX Spike): {self.reason}")
+            return True
+        
+        # CB4: Market Halted
+        if market_data.get('market_halted', False):
+            self.triggered = True
+            self.reason = "Market circuit breaker triggered"
+            self.action = 'HALT_ALL'
+            log.critical(f"🛑 CIRCUIT BREAKER 4 (Market Halt): {self.reason}")
+            return True
+        
+        # All clear
+        self.triggered = False
+        self.action = None
+        return False
+    
+    def get_action(self) -> str:
+        return self.action or 'OK'
+
+
+# ─────────────────────────────────────────────────────────────
+# FINAL DECISION RESOLVER
+# ─────────────────────────────────────────────────────────────
+
+FINAL_STATUS_SELL      = "SELL"
+FINAL_STATUS_BUY       = "BUY"
+FINAL_STATUS_HOLD      = "HOLD"
+FINAL_STATUS_SKIPPED   = "SKIPPED"
+FINAL_STATUS_REJECTED  = "REJECTED"
+
+class FinalDecisionResolver:
+    """Auflösung von Konflikten (mehrere Entscheidungen pro Ticker) mit Prioritäten."""
+    FORCED_EXIT_MARKERS = ("stop_loss", "zombie_cleanup", "forced_rebalancing")
+    SELL_PRIORITY = {
+        "stop_loss":          100,
+        "zombie_cleanup":      90,
+        "forced_rebalancing":  80,
+        "rebalancing":         70,
+        "normal":              50,
+    }
+
+    def resolve(self, decisions: List[Dict]) -> List[Dict]:
+        by_ticker: Dict[str, List[Dict]] = {}
+        for d in decisions:
+            t = d.get("ticker", "")
+            if not t:
+                continue
+            by_ticker.setdefault(t, []).append(d)
+
+        resolved = []
+        for ticker, candidates in by_ticker.items():
+            if len(candidates) == 1:
+                resolved.append(candidates[0])
+                continue
+            winner = self._pick_winner(ticker, candidates)
+            resolved.append(winner)
+        return resolved
+
+    def _pick_winner(self, ticker: str, candidates: List[Dict]) -> Dict:
+        forced_exits = [c for c in candidates if any(c.get(m, False) for m in self.FORCED_EXIT_MARKERS)]
+        sells = [c for c in candidates if c.get("action") == "SELL"]
+        buys = [c for c in candidates if c.get("action") == "BUY" and c.get("risk_approved", False)]
+        holds = [c for c in candidates if c.get("action") == "HOLD"]
+
+        if forced_exits:
+            forced_exits.sort(key=lambda c: self._forced_exit_priority(c), reverse=True)
+            winner = forced_exits[0]
+            winner["action"] = "SELL"
+            winner["risk_approved"] = True
+            return winner
+        if sells:
+            sells.sort(key=lambda c: self._sell_type_priority(c), reverse=True)
+            return sells[0]
+        if buys:
+            buys.sort(key=lambda c: c.get("confidence", 0), reverse=True)
+            return buys[0]
+        if holds:
+            return holds[-1]
+        return candidates[0]
+
+    def _forced_exit_priority(self, d: Dict) -> int:
+        if d.get("stop_loss"):
+            return 100
+        if d.get("zombie_cleanup"):
+            return 90
+        if d.get("forced_rebalancing"):
+            return 80
+        return 0
+
+    def _sell_type_priority(self, d: Dict) -> int:
+        sell_type = "normal"
+        if d.get("stop_loss"):
+            sell_type = "stop_loss"
+        elif d.get("zombie_cleanup"):
+            sell_type = "zombie_cleanup"
+        elif d.get("forced_rebalancing"):
+            sell_type = "forced_rebalancing"
+        elif d.get("rebalancing"):
+            sell_type = "rebalancing"
+        return self.SELL_PRIORITY.get(sell_type, 50)
+
+
+# ─────────────────────────────────────────────────────────────
+# RISK MANAGER HAUPTKLASSE
+# ─────────────────────────────────────────────────────────────
+
+class RiskManager:
+
+    def __init__(self, risk_profile: RiskProfile = None):
+        self.risk_profile = risk_profile or ACTIVE_RISK_PROFILE
+        self.settings = RISK_SETTINGS[self.risk_profile].copy()
+        self._base_settings = RISK_SETTINGS[self.risk_profile].copy()
+        self._resolver = FinalDecisionResolver()
+        self.regime_state = None
+        log.info(f"Risk Manager initialisiert: Profil={self.risk_profile.value.upper()}")
+        log.info(
+            f"  Max Position: {self.settings['max_position_pct']*100:.0f}% | "
+            f"Min Cash: {self.settings['min_cash_pct']*100:.0f}% | "
+            f"Stop-Loss: {self.settings['stop_loss_pct']*100:.0f}% | "
+            f"Max Trades: {self.settings.get('max_trades_per_run', TOP_N_BUYS)}"
+        )
+
+    # ─── REGIME-AWARE CONFIDENCE THRESHOLDS (NEU) ─────────────────────────
+    def get_dynamic_thresholds(self, regime_state=None) -> Dict[str, float]:
+        """
+        Holt regimespezifische Confidence-Schwellen aus config.
+        """
+        if regime_state is None:
+            regime = "SIDEWAYS"
+        else:
+            regime_val = getattr(regime_state, 'regime', None)
+            if regime_val is not None:
+                if hasattr(regime_val, 'value'):
+                    regime = regime_val.value.upper()
+                else:
+                    regime = str(regime_val).upper()
+            else:
+                regime = getattr(regime_state, 'label', 'SIDEWAYS').upper()
+        thresholds = REGIME_CONFIDENCE_THRESHOLDS.get(regime, REGIME_CONFIDENCE_THRESHOLDS["SIDEWAYS"])
+        return {"buy": thresholds["buy_threshold"], "sell": thresholds["sell_threshold"]}
+
+    # ─── EMERGENCY CASH MODE ──────────────────────────────────────────
+    def emergency_cash_mode(self, portfolio_summary: Dict, market_data: Dict) -> bool:
+        max_daily_loss = self.settings.get("max_daily_loss_pct", 0.05)
+        daily_pnl = portfolio_summary.get("daily_pnl_pct", 0.0)
+        if daily_pnl < -max_daily_loss:
+            log.critical(f"EMERGENCY CASH MODE: Daily loss {daily_pnl:.2%} < -{max_daily_loss:.2%}")
+            return True
+        return False
+
+    # ─── DYNAMISCHE MAX-TRADES (abhängig von VIX) ─────────────────────
+    def _dynamic_max_trades(self, market_data: Dict) -> int:
+        vix = market_data.get('vix', 20)
+        base_max = self.settings.get("max_trades_per_run", TOP_N_BUYS)
+        if vix > 30:
+            return max(1, base_max // 2)
+        elif vix < 15:
+            return base_max
+        else:
+            return base_max
+
+    # ─── ATR-BASED STOP-LOSS ─────────────────────────────────────────
+    def calculate_dynamic_stop_loss(
         self,
+        ticker: str,
+        avg_price: float,
         market_data: Dict[str, Dict],
-        trail_pct: float = 0.12,
-    ) -> List[Dict]:
+        atr_multiplier: float = 2.5,
+    ) -> float:
+        import math
+        ticker_data = market_data.get(ticker, {})
+        annual_vol = ticker_data.get("volatility_annual", 0.20)
+        daily_vol = annual_vol / math.sqrt(252)
+        atr_approx = avg_price * daily_vol
+        dynamic_stop = avg_price - (atr_approx * atr_multiplier)
+        fixed_stop_pct = self.settings.get("stop_loss_pct", 0.08)
+        fixed_stop = avg_price * (1 - fixed_stop_pct)
+        return max(dynamic_stop, fixed_stop)
+
+    # ─── VOLATILITY-ADJUSTED POSITION SIZING ─────────────────────────
+    def volatility_adjusted_allocation(
+        self,
+        base_allocation: float,
+        asset_volatility_pct: float,
+        target_volatility: float = 0.15,
+    ) -> float:
+        if asset_volatility_pct <= 0:
+            asset_volatility_pct = 0.15
+        scale = target_volatility / asset_volatility_pct
+        scale = max(0.3, min(2.0, scale))
+        adjusted = base_allocation * scale
+        max_position = self.settings.get("max_position_pct", 0.25)
+        return min(adjusted, max_position)
+
+    # ─── REGIME ANPASSUNG (ÜBERNIMMT DIE VORHANDENE) ─────────────────
+    def apply_regime(self, regime_state) -> None:
+        from market_regime import apply_regime_to_risk_settings
+        self.regime_state = regime_state
+        self.settings = apply_regime_to_risk_settings(self._base_settings, regime_state)
+
+    # ─── SEKTOR / FAKTOR HELPER ─────────────────────────────────────
+    def _sector_of(self, ticker: str) -> str:
+        return SECTOR_CLASSIFICATION.get(ticker, "diversified")
+
+    def _factor_of(self, ticker: str) -> str:
+        return FACTOR_CLASSIFICATION.get(ticker, self._sector_of(ticker))
+
+    def _sector_exposure(self, positions: Dict, total_value: float) -> Dict[str, float]:
+        exposure = {}
+        for ticker, pos in positions.items():
+            alloc = pos.get("market_value", 0) / total_value if total_value > 0 else 0
+            sector = self._sector_of(ticker)
+            weights = ETF_SECTOR_WEIGHTS.get(ticker)
+            if weights:
+                for label, weight in weights.items():
+                    exposure[label] = exposure.get(label, 0.0) + alloc * weight
+            else:
+                exposure[sector] = exposure.get(sector, 0.0) + alloc
+        return exposure
+
+    # ─── VALIDIERUNG DER ENTSCHEIDUNGEN (Hauptmethode mit dynamischen Thresholds) ───────────────
+    def validate_decisions(
+        self,
+        decisions: List[Dict],
+        portfolio_summary: Dict,
+        market_data: Dict[str, Dict],
+    ) -> Tuple[List[Dict], List[str]]:
         """
-        Trailing Stop Engine: Generiert automatische Sell-Signale bei Profit-Takes.
-        Bedingung: unrealized_gain > 8% und current_price < high_52w * (1 - trail_pct)
+        Prüft und korrigiert alle KI-Entscheidungen.
+        Verwendet regimespezifische Confidence-Thresholds.
         """
-        trailing_sells = []
-        for ticker, pos in self.positions.items():
-            if pos.get("quantity", 0) <= 0:
+        warnings = []
+        validated = []
+        max_pos = self.settings["max_position_pct"]
+        min_cash = self.settings["min_cash_pct"]
+        max_sector = self.settings.get("max_sector_exposure", 0.45)
+        max_factor = self.settings.get("max_factor_exposure", 0.60)
+
+        total_value = portfolio_summary.get("total_value", 1)
+        running_cash = portfolio_summary.get("cash", 0)
+        positions = portfolio_summary.get("positions", {})
+
+        decisions = ensure_decision_ids(decisions)
+
+        # ── CIRCUIT BREAKER CHECK ─────────────────────────────────────
+        breaker = CircuitBreaker()
+        if breaker.check_all(portfolio_summary, market_data):
+            log.warning(f"Circuit Breaker Action: {breaker.get_action()}")
+            if breaker.action == 'STOP_ALL_BUYS':
+                decisions = [d for d in decisions if d.get('action') != 'BUY']
+                warnings.append(f"🛑 Circuit Breaker: STOP_ALL_BUYS. {breaker.reason}")
+            elif breaker.action == 'REDUCE_EXPOSURE':
+                for d in decisions:
+                    if d.get('action') == 'BUY':
+                        d['target_allocation'] *= 0.5
+                warnings.append(f"🛑 Circuit Breaker: REDUCE_EXPOSURE. {breaker.reason}")
+            elif breaker.action == 'DE_RISK_50':
+                forced_sells = []
+                positions_list = sorted(positions.items(), key=lambda x: x[1].get('market_value', 0))
+                total_sell_value = total_value * 0.5
+                current_sell_value = 0
+                for ticker, pos in positions_list:
+                    if current_sell_value >= total_sell_value:
+                        break
+                    if pos.get('quantity', 0) > 0:
+                        forced_sells.append({
+                            'ticker': ticker,
+                            'action': 'SELL',
+                            'target_allocation': 0.0,
+                            'confidence': 1.0,
+                            'reason': '🛑 Circuit Breaker: DE_RISK_50',
+                            'priority': 'CRITICAL'
+                        })
+                        current_sell_value += pos.get('market_value', 0)
+                decisions.extend(forced_sells)
+                warnings.append(f"🛑 Circuit Breaker: DE_RISK_50 (generated {len(forced_sells)} forced SELLs). {breaker.reason}")
+            elif breaker.action == 'HALT_ALL':
+                decisions = []
+                warnings.append(f"🛑 Circuit Breaker: HALT_ALL (all trades blocked). {breaker.reason}")
+
+        # ── EMERGENCY CASH MODE ───────────────────────────────────────
+        if self.emergency_cash_mode(portfolio_summary, market_data):
+            for ticker, pos in positions.items():
+                if pos.get('quantity', 0) > 0:
+                    decisions.append({
+                        'ticker': ticker,
+                        'action': 'SELL',
+                        'target_allocation': 0.0,
+                        'confidence': 1.0,
+                        'reason': 'EMERGENCY CASH MODE: daily loss exceeded',
+                        'risk_approved': True,
+                        'forced_rebalancing': True,
+                    })
+            warnings.append("🚨 EMERGENCY CASH MODE ACTIVATED: all positions liquidated")
+
+        # ─── REGIME-AWARE CONFIDENCE THRESHOLDS ───────────────────────
+        dyn_thresholds = self.get_dynamic_thresholds(self.regime_state)
+        buy_conf_threshold = dyn_thresholds["buy"]
+        sell_conf_threshold = dyn_thresholds["sell"]
+        log.info(f"Dynamic thresholds: BUY={buy_conf_threshold:.0%}, SELL={sell_conf_threshold:.0%}")
+
+        # ─── UNGÜLTIGE SELLS FILTERN ──────────────────────────────────
+        decisions, sell_warnings = self._filter_invalid_sells(decisions, positions)
+        warnings.extend(sell_warnings)
+
+        # ─── REBALANCING SELLS GENERIEREN ─────────────────────────────
+        rebalance_sells = self._generate_rebalancing_decisions(decisions, portfolio_summary)
+        decisions = rebalance_sells + decisions
+
+        # ─── DYNAMISCHE MAX-TRADES ────────────────────────────────────
+        max_trades = self._dynamic_max_trades(market_data)
+
+        # ─── WEITERE RISIKO-FILTER (Sektor, Faktor, Top-N) ────────────
+        hold_decisions = [d for d in decisions if d.get("action") == "HOLD"]
+        sell_decisions = [d for d in decisions if d.get("action") == "SELL"]
+        buy_decisions = [d for d in decisions if d.get("action") == "BUY"]
+
+        sector_exposure = self._sector_exposure(positions, total_value)
+        factor_exposure = {}
+
+        for d in hold_decisions:
+            d["risk_approved"] = True
+            validated.append(d)
+
+        for d in sell_decisions:
+            ticker = d.get("ticker", "?")
+            conf = d.get("confidence", 0)
+            is_rebal = d.get("rebalancing", False)
+            is_zombie = d.get("zombie_cleanup", False)
+            is_stop = d.get("stop_loss", False)
+            is_forced = d.get("forced_rebalancing", False)
+
+            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
+                d = dict(d)
+                d["action"] = "HOLD"
+                d["reason"] += f" [RISK: Konfidenz {conf:.0%} < SELL threshold {sell_conf_threshold:.0%}]"
+                d["risk_approved"] = False
+                validated.append(d)
+                warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD (SELL threshold {sell_conf_threshold:.0%})")
                 continue
-            unrealized_pnl_pct = pos.get("unrealized_pnl_pct", 0.0)
-            if unrealized_pnl_pct <= 0.08:
+
+            # Cash aktualisieren
+            pos_market_value = positions.get(ticker, {}).get("market_value", 0)
+            target_alloc = d.get("target_allocation", 0)
+            sell_value = (pos_market_value if target_alloc == 0.0
+                         else max(0, (pos_market_value / total_value - target_alloc) * total_value))
+            running_cash += sell_value
+            d["risk_approved"] = True
+            validated.append(d)
+
+        qualified = [d for d in buy_decisions if d.get("confidence", 0) >= buy_conf_threshold]
+        qualified.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        top_buys = qualified[:max_trades]
+        skip_buys = qualified[max_trades:]
+
+        for d in skip_buys:
+            d = dict(d)
+            d["action"] = "HOLD"
+            d["reason"] += f" [RISK: Max-Trades ({max_trades}) Limit]"
+            d["risk_approved"] = False
+            validated.append(d)
+            warnings.append(f"{d['ticker']}: Max-Trades Limit → HOLD")
+
+        # BUYs mit Cash-Reserve validieren
+        for d in top_buys:
+            ticker = d.get("ticker", "?")
+            target_alloc = d.get("target_allocation", 0)
+            current_value = positions.get(ticker, {}).get("market_value", 0)
+            buy_cost = max(0, total_value * target_alloc - current_value)
+            cash_after = running_cash - buy_cost
+            cash_pct = cash_after / total_value if total_value > 0 else 0
+
+            if cash_pct < min_cash:
+                max_spend = running_cash - (total_value * min_cash)
+                if max_spend >= 500:
+                    reduced_target = (current_value + max_spend) / total_value
+                    d["target_allocation"] = round(reduced_target, 4)
+                    running_cash -= max_spend
+                    warnings.append(f"{ticker}: Teilkauf auf {reduced_target:.0%} (${max_spend:,.0f})")
+                    d["risk_approved"] = True
+                    validated.append(d)
+                else:
+                    d = dict(d)
+                    d["action"] = "HOLD"
+                    d["reason"] += " [RISK: Cash reicht nicht]"
+                    d["risk_approved"] = False
+                    validated.append(d)
+                    warnings.append(f"{ticker}: Cash reicht nicht → HOLD")
                 continue
-            ticker_data = market_data.get(ticker, {})
-            high_52w = ticker_data.get("high_52w")
-            current_price = ticker_data.get("current_price") or pos.get("current_price", 0)
-            if high_52w is None or current_price <= 0:
+
+            running_cash -= buy_cost
+            d["risk_approved"] = True
+            validated.append(d)
+
+        # Finale Cash-Invariante durchsetzen
+        validated, cash_warnings = self._enforce_cash_invariant(
+            validated, total_value, running_cash, min_cash, positions, market_data
+        )
+        warnings.extend(cash_warnings)
+
+        # Konflikte auflösen
+        validated = self._resolver.resolve(validated)
+
+        # Status setzen
+        for d in validated:
+            if d.get("action") in ("BUY", "SELL") and d.get("risk_approved", False):
+                d["status"] = "APPROVED"
+            elif not d.get("risk_approved", True):
+                d["status"] = "BLOCKED"
+            else:
+                d["status"] = "HOLD"
+
+        log.info(
+            f"Risikoprüfung abgeschlossen | "
+            f"FINAL: {sum(1 for d in validated if d['action']=='SELL')} SELL | "
+            f"{sum(1 for d in validated if d['action']=='BUY' and d.get('risk_approved'))} BUY | "
+            f"Cash: {format_currency(running_cash)} ({running_cash/total_value:.0%})"
+        )
+        return validated, warnings
+
+    # ─── HILFSMETHODEN (unverändert aus vorheriger Version) ────────────
+    def _filter_invalid_sells(self, decisions: List[Dict], positions: Dict) -> Tuple[List[Dict], List[str]]:
+        warnings = []
+        filtered = []
+        for d in decisions:
+            if d.get("action") == "SELL" and d["ticker"] not in positions:
+                is_special = d.get("zombie_cleanup") or d.get("stop_loss")
+                if not is_special:
+                    warnings.append(f"{d['ticker']}: SELL für nicht gehaltene Position → gefiltert")
                 continue
-            trail_level = high_52w * (1 - trail_pct)
-            if current_price < trail_level:
-                trailing_sells.append({
+            filtered.append(d)
+        return filtered, warnings
+
+    def _generate_rebalancing_decisions(self, decisions: List[Dict], portfolio_summary: Dict) -> List[Dict]:
+        total_value = portfolio_summary.get("total_value", 1)
+        positions = portfolio_summary.get("positions", {})
+        target_map = {d["ticker"]: d.get("target_allocation", 0) for d in decisions if d.get("action") in ("BUY", "SELL")}
+        rebalance_sells = []
+        for ticker, pos in positions.items():
+            current_alloc = pos.get("market_value", 0) / total_value
+            target_alloc = target_map.get(ticker)
+            if target_alloc is None:
+                continue
+            if current_alloc > target_alloc + 0.03:
+                already_sell = any(d["ticker"] == ticker and d["action"] == "SELL" for d in decisions)
+                if not already_sell:
+                    rebalance_sells.append({
+                        "ticker": ticker,
+                        "action": "SELL",
+                        "target_allocation": target_alloc,
+                        "confidence": 0.80,
+                        "reason": f"Rebalancing: {current_alloc:.0%} -> {target_alloc:.0%}",
+                        "risk_approved": True,
+                        "rebalancing": True,
+                    })
+        return rebalance_sells
+
+    def _enforce_cash_invariant(
+        self,
+        validated: List[Dict],
+        total_value: float,
+        projected_cash: float,
+        min_cash_pct: float,
+        positions: Dict,
+        market_data: Dict,
+    ) -> Tuple[List[Dict], List[str]]:
+        warnings = []
+        min_cash_abs = total_value * min_cash_pct
+        if projected_cash >= min_cash_abs:
+            return validated, warnings
+
+        shortfall = min_cash_abs - projected_cash
+        log.warning(f"[HARD GATE] Cash-Invariante verletzt! Fehlbetrag: {format_currency(shortfall)}")
+
+        # BUYs canceln (niedrigste Konfidenz zuerst)
+        approved_buys = [d for d in validated if d.get("action") == "BUY" and d.get("risk_approved")]
+        approved_buys.sort(key=lambda x: x.get("confidence", 0))
+        recovered = projected_cash
+        for d in approved_buys:
+            if recovered >= min_cash_abs:
+                break
+            ticker = d["ticker"]
+            buy_cost = max(0.0, total_value * d.get("target_allocation", 0) - positions.get(ticker, {}).get("market_value", 0))
+            d["action"] = "HOLD"
+            d["reason"] += " [HARD GATE: BUY gecancelt für Cash-Reserve]"
+            d["risk_approved"] = False
+            recovered += buy_cost
+            warnings.append(f"{ticker}: BUY gecancelt → Cash freigegeben ~{format_currency(buy_cost)}")
+
+        if recovered >= min_cash_abs:
+            return validated, warnings
+
+        # Notfalls: SELLs generieren
+        candidates = []
+        for ticker, pos in positions.items():
+            if any(d.get("ticker") == ticker and d.get("action") == "SELL" for d in validated):
+                continue
+            current_alloc = pos.get("market_value", 0) / total_value if total_value > 0 else 0
+            market_val = pos.get("market_value", 0)
+            if market_val <= 0:
+                continue
+            priority = current_alloc * (1 + max(0, -pos.get("unrealized_pnl_pct", 0) / 100))
+            candidates.append({"ticker": ticker, "market_value": market_val, "priority": priority})
+
+        candidates.sort(key=lambda x: -x["priority"])
+        still_needed = min_cash_abs - recovered
+        for cand in candidates:
+            if still_needed <= 0:
+                break
+            sell_amount = min(cand["market_value"], still_needed * 1.05)
+            if sell_amount < 100:
+                continue
+            forced_sell = {
+                "ticker": cand["ticker"],
+                "action": "SELL",
+                "target_allocation": 0.0,
+                "confidence": 1.0,
+                "reason": "[AUTO-REBALANCING] Cash unter Minimum",
+                "risk_approved": True,
+                "forced_rebalancing": True,
+            }
+            validated.append(forced_sell)
+            recovered += sell_amount
+            still_needed -= sell_amount
+
+        return validated, warnings
+
+    # ─── STOP-LOSS ─────────────────────────────────────────────────
+    def check_stop_loss(self, positions: Dict, market_data: Dict) -> List[Dict]:
+        stop_loss_pct = self.settings["stop_loss_pct"]
+        stop_loss_orders = []
+        for ticker, pos in positions.items():
+            avg_price = pos.get("avg_price", 0)
+            current_price = market_data.get(ticker, {}).get("current_price", 0)
+            if avg_price <= 0 or current_price <= 0:
+                continue
+            loss_pct = (current_price - avg_price) / avg_price
+            if loss_pct < -stop_loss_pct:
+                log.warning(f"STOP-LOSS: {ticker} | Verlust: {loss_pct:.1%}")
+                stop_loss_orders.append({
                     "ticker": ticker,
                     "action": "SELL",
                     "target_allocation": 0.0,
-                    "confidence": 0.95,
-                    "reason": f"Trailing Stop: {unrealized_pnl_pct:+.1%} gain, price ${current_price:.2f} < trail ${trail_level:.2f}",
+                    "confidence": 1.0,
+                    "reason": f"Stop-Loss: {loss_pct:.1%} Verlust",
                     "risk_approved": True,
-                    "trailing_stop": True,
+                    "stop_loss": True,
                 })
-                log.info(f"  Trailing Stop Trigger: {ticker} | Gain: {unrealized_pnl_pct:+.1%}")
-        return trailing_sells
+        return stop_loss_orders
 
-    # ─── STALE POSITION DETECTION ─────────────────────────────────────────────
-    def stale_position_flag(
+    # ─── VAR BERECHNUNG ────────────────────────────────────────────
+    def calculate_portfolio_var(
         self,
-        stale_gain_low: float = -0.02,
-        stale_gain_high: float = 0.02,
-        min_hold_days: int = 15,
-    ) -> Dict[str, Dict]:
-        """Markiert Positionen als 'stale' (nur Flag, kein erzwungener Verkauf)."""
-        stale_flags = {}
-        today = datetime.now()
-        for ticker, pos in self.positions.items():
-            pnl_pct_raw = pos.get("unrealized_pnl_pct", 0.0)
-            pnl_pct = pnl_pct_raw / 100.0 if abs(pnl_pct_raw) > 1.0 else pnl_pct_raw
-            hold_days = 0
-            entry_date_str = pos.get("entry_date")
-            if entry_date_str:
-                try:
-                    entry_dt = datetime.fromisoformat(entry_date_str)
-                    hold_days = max(0, (today - entry_dt).days)
-                except Exception:
-                    hold_days = 0
-            is_stale = (stale_gain_low <= pnl_pct <= stale_gain_high and hold_days >= min_hold_days)
-            stale_flags[ticker] = {
-                "stale": is_stale,
-                "pnl_pct": round(pnl_pct * 100, 2),
-                "hold_days": hold_days,
-            }
-            if is_stale:
-                log.info(f"[STALE FLAG] {ticker}: {pnl_pct:+.1%} unrealized, {hold_days}d held")
-        return stale_flags
+        positions: Dict[str, Dict],
+        market_data: Dict[str, Dict],
+        total_value: float,
+        confidence: float = 0.95,
+    ) -> Dict:
+        import numpy as np
+        from scipy.stats import norm
+        if total_value <= 0 or not positions:
+            return {"var_pct": 0.0, "var_usd": 0.0, "component_vars": {}}
 
-    def print_summary(self):
-        total = self.get_total_value()
-        log.info("=" * 60)
-        log.info(f"PORTFOLIO ({self.mode})")
-        log.info(f"  Gesamtwert:  {format_currency(total)}")
-        log.info(f"  Cash:        {format_currency(self.cash)} ({self.cash/total*100:.1f}%)")
-        log.info(f"  P&L:         {format_currency(total - self.initial_capital)} "
-                 f"({pct_change(self.initial_capital, total):+.2f}%)")
-        log.info(f"  Positionen:  {len(self.positions)}")
-        for ticker, pos in self.positions.items():
-            alloc = pos.get("market_value", 0) / total * 100 if total else 0
-            log.info(
-                f"    {ticker:<6} {pos.get('quantity', 0):.4f} Stk @ "
-                f"${pos.get('avg_price', 0):.2f} -> "
-                f"{format_currency(pos.get('market_value', 0))} | "
-                f"({alloc:.1f}%) | "
-                f"P&L: {format_currency(pos.get('unrealized_pnl', 0))}"
-            )
-        log.info("=" * 60)
+        weights = []
+        vols = []
+        tickers = []
+        for ticker, pos in positions.items():
+            alloc = pos.get("market_value", 0) / total_value
+            vol_annual = (market_data.get(ticker, {}).get("volatility_annual_pct") or 20.0) / 100
+            vol_daily = vol_annual / (252 ** 0.5)
+            weights.append(alloc)
+            vols.append(vol_daily)
+            tickers.append(ticker)
 
-    # --- Trade-Ausfuehrung (lokal) -------------------------------------------
+        w = np.array(weights)
+        v = np.array(vols)
+        portfolio_vol = float(np.sqrt(np.sum((w * v) ** 2)))
+        z_score = norm.ppf(confidence)
+        var_pct = portfolio_vol * z_score
+        var_usd = var_pct * total_value
+        return {"var_pct": round(var_pct, 4), "var_usd": round(var_usd, 2)}
 
-    def apply_trade(self, ticker: str, action: str, quantity: float, price: float):
-        if self.read_only:
-            log.info(f"[DRY] Simuliert: {action} {ticker} {quantity:.4f} Stk @ ${price:.2f}")
-            return True
+    def check_var_limit(self, positions: Dict, market_data: Dict, total_value: float) -> Tuple[bool, str]:
+        max_var = self.settings.get("max_portfolio_var", 0.05)
+        var_data = self.calculate_portfolio_var(positions, market_data, total_value)
+        var_pct = var_data.get("var_pct", 0)
+        if var_pct > max_var:
+            return False, f"Portfolio VaR {var_pct:.1%} > max {max_var:.1%}"
+        return True, f"VaR OK: {var_pct:.1%}"
 
-        trade_value = quantity * price
-
-        if action == "BUY":
-            if trade_value > self.cash:
-                log.warning(f"BUY {ticker} blockiert: benötigt {format_currency(trade_value)}, verfügbar {format_currency(self.cash)}")
-                return False
-
-            from config import RISK_SETTINGS, ACTIVE_RISK_PROFILE
-            min_cash_pct = RISK_SETTINGS[ACTIVE_RISK_PROFILE]["min_cash_pct"]
-            total_value = self.get_total_value()
-            min_cash_required = total_value * min_cash_pct
-            cash_after_trade = self.cash - trade_value
-            if cash_after_trade < min_cash_required:
-                max_spendable = self.cash - min_cash_required
-                if max_spendable < 100.0:
-                    log.warning(f"BUY {ticker} blockiert: Cash würde unter Minimum fallen")
-                    return False
-                quantity = round(max_spendable / price, 6)
-                trade_value = quantity * price
-                log.info(f"BUY {ticker} auf max. {format_currency(trade_value)} reduziert")
-
-            self.cash -= trade_value
-            if ticker in self.positions:
-                pos = self.positions[ticker]
-                old_qty = pos["quantity"]
-                old_cost = pos["cost_basis"]
-                new_qty = old_qty + quantity
-                pos["quantity"] = new_qty
-                pos["qty_available"] = new_qty
-                pos["cost_basis"] = old_cost + trade_value
-                pos["avg_price"] = pos["cost_basis"] / new_qty
-                pos["current_price"] = price
-                pos["market_value"] = new_qty * price
-            else:
-                self.positions[ticker] = {
-                    "ticker": ticker,
-                    "quantity": quantity,
-                    "qty_available": quantity,
-                    "avg_price": price,
-                    "current_price": price,
-                    "market_value": trade_value,
-                    "cost_basis": trade_value,
-                    "unrealized_pnl": 0.0,
-                    "unrealized_pnl_pct": 0.0,
-                    "entry_date": datetime.now().isoformat(),
-                }
-            log.info(f"Position {ticker} GEKAUFT: {quantity:.6f} Stk @ ${price:.2f}")
-
-        elif action == "SELL":
-            if ticker not in self.positions:
-                log.warning(f"Kann {ticker} nicht verkaufen – keine Position.")
-                return False
-            pos = self.positions[ticker]
-            available = pos.get("qty_available", pos["quantity"])
-            sell_qty = round(min(quantity, available), 6)
-            if sell_qty <= 0:
-                log.warning(f"SELL {ticker}: keine verfügbare Menge")
-                return False
-            sell_value = sell_qty * price
-            self.cash += sell_value
-            pos["quantity"] -= sell_qty
-            pos["qty_available"] = round(max(0.0, available - sell_qty), 6)
-            pos["cost_basis"] = pos["avg_price"] * pos["quantity"]
-            pos["current_price"] = price
-            pos["market_value"] = pos["quantity"] * price
-            from utils import ZOMBIE_POSITION_THRESHOLD
-            residual_value = pos["quantity"] * pos["current_price"]
-            if pos["quantity"] <= 0.0001 or residual_value < ZOMBIE_POSITION_THRESHOLD:
-                del self.positions[ticker]
-                log.info(f"Position {ticker} vollständig geschlossen.")
-            else:
-                log.info(f"Position {ticker} reduziert: {sell_qty:.6f} Stk verkauft @ ${price:.2f}")
-
-        self.save()
-        return True
-
-    # --- Rebalancing-Berechnung (verbessert) ---------------------------------
-
-    def calculate_rebalancing_trades(
-        self,
-        target_allocations: Dict[str, float],
-        current_prices: Dict[str, float],
-        decisions_map: Dict[str, Dict] = None,
-        min_trade_value: float = 10.0,   # jetzt nur noch "execution safety floor"
-    ) -> List[Dict]:
-        """
-        Berechnet Trades basierend auf Zielallokationen.
-        min_trade_value ist nur ein Sicherheits-Floor, nicht die primäre Logik.
-        """
-        decisions_map = decisions_map or {}
-        total_value = self.get_total_value()
-        current_allocs = self.get_allocations()
-        trades = []
-
-        # Dynamische Mindestordergröße als Prozentsatz (0.5% des Portfolios, aber mindestens 10 USD)
-        min_trade_abs = max(10.0, total_value * 0.005)
-
-        for ticker, target_alloc in target_allocations.items():
-            if ticker == "CASH":
-                continue
-
-            price = current_prices.get(ticker)
-            if not price or price <= 0:
-                log.warning(f"Kein Preis für {ticker}, überspringe.")
-                continue
-
-            current_value = self.positions.get(ticker, {}).get("market_value", 0)
-            target_value = total_value * target_alloc
-            diff_value = target_value - current_value
-
-            if abs(diff_value) < min_trade_abs:
-                # nur loggen, nicht ignorieren – aber trotzdem Trade generieren,
-                # wenn die relative Abweichung signifikant ist (> 2% des Portfolios)
-                if abs(target_alloc - current_allocs.get(ticker, 0)) < 0.02:
-                    continue
-
-            action = "BUY" if diff_value > 0 else "SELL"
-            quantity = abs(diff_value) / price
-            actual_value = abs(diff_value)
-
-            trades.append({
-                "ticker": ticker,
-                "action": action,
-                "quantity": round(quantity, 6),
-                "price": price,
-                "value": round(actual_value, 2),
-                "current_alloc": round(current_allocs.get(ticker, 0), 4),
-                "target_alloc": round(target_alloc, 4),
-                "diff_value": round(diff_value, 2),
-                "ai_action": decisions_map.get(ticker, {}).get("action", action),
-                "ai_reason": decisions_map.get(ticker, {}).get("reason", ""),
-                "ai_confidence": decisions_map.get(ticker, {}).get("confidence", 0.7),
-                "decision_id": decisions_map.get(ticker, {}).get("decision_id"),
-            })
-
-        # SELLs zuerst
-        trades.sort(key=lambda t: 0 if t["action"] == "SELL" else 1)
-        return trades
-
-    def simulate_trade_plan(self, trades: List[Dict], current_prices: Dict[str, float], min_cash_pct: float = 0.0) -> Dict:
-        working_positions = copy.deepcopy(self.positions)
-        cash = self.cash
-        total_value = cash + sum(p.get("market_value", 0) for p in working_positions.values())
-        min_cash = max(0.0, total_value * min_cash_pct)
-
-        for trade in sorted(trades, key=lambda x: 0 if x["action"] == "SELL" else 1):
-            ticker = trade["ticker"]
-            price = current_prices.get(ticker, trade.get("price", 0))
-            if price <= 0:
-                continue
-            if trade["action"] == "SELL":
-                pos = working_positions.get(ticker)
-                if not pos:
-                    continue
-                quantity = min(trade.get("quantity", 0), pos.get("quantity", 0))
-                if quantity <= 0:
-                    continue
-                value = round(quantity * price, 2)
-                cash += value
-                pos["quantity"] = round(pos.get("quantity", 0) - quantity, 6)
-                pos["current_price"] = price
-                pos["market_value"] = round(pos["quantity"] * price, 2)
-                pos["cost_basis"] = round(pos.get("avg_price", 0) * pos["quantity"], 2)
-                if pos["quantity"] <= 0 or pos["market_value"] < 1.0:
-                    working_positions.pop(ticker, None)
-            else:  # BUY
-                spendable = max(0.0, cash - min_cash)
-                order_value = min(trade.get("value", 0), spendable)
-                if order_value < 1.0:
-                    continue
-                quantity = round(order_value / price, 6)
-                if quantity <= 0:
-                    continue
-                value = round(quantity * price, 2)
-                cash -= value
-                pos = working_positions.get(ticker)
-                if pos:
-                    cost_basis = pos.get("cost_basis", 0) + value
-                    quantity_total = pos.get("quantity", 0) + quantity
-                    pos.update({
-                        "quantity": quantity_total, "qty_available": quantity_total,
-                        "cost_basis": round(cost_basis, 2), "avg_price": round(cost_basis / quantity_total, 6),
-                        "current_price": price, "market_value": round(quantity_total * price, 2),
-                    })
-                else:
-                    working_positions[ticker] = {
-                        "ticker": ticker, "quantity": quantity, "qty_available": quantity, "avg_price": price,
-                        "current_price": price, "market_value": round(value, 2), "cost_basis": round(value, 2),
-                        "unrealized_pnl": 0.0, "unrealized_pnl_pct": 0.0, "entry_date": datetime.now().isoformat(),
-                    }
-
-        invested = sum(p.get("market_value", 0) for p in working_positions.values())
-        total_after = round(cash + invested, 2)
-        pnl_pct = pct_change(self.initial_capital, total_after) if total_after else 0
+    def get_risk_summary(self) -> Dict:
         return {
-            "total_value": total_after, "cash": round(cash, 2), "cash_pct": round(cash / total_after * 100, 2) if total_after else 0,
-            "invested": round(invested, 2), "initial_capital": self.initial_capital,
-            "unrealized_pnl": round(sum(p.get("market_value", 0) - p.get("cost_basis", 0) for p in working_positions.values()), 2),
-            "pnl_pct": round(pnl_pct, 2), "n_positions": len(working_positions), "positions": working_positions,
-            "mode": self.mode, "assumed_min_cash_pct": min_cash_pct,
+            "profile": self.risk_profile.value,
+            "max_position_pct": self.settings["max_position_pct"],
+            "min_cash_pct": self.settings["min_cash_pct"],
+            "stop_loss_pct": self.settings["stop_loss_pct"],
+            "max_trades_per_run": self.settings.get("max_trades_per_run", TOP_N_BUYS),
+            "confidence_threshold": self.settings["confidence_threshold"],
         }
