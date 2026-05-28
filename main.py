@@ -486,8 +486,9 @@ class TradingBot:
             market_data=market_data,
             execution_mode=run_summary.get("execution_mode", "SIMULATED"),
             market_closed=run_summary.get("market_closed", False),
+            risk_manager=self.risk_manager,   # <-- NEU
         )
-
+        
         duration = (datetime.now() - start_time).seconds
         run_summary.update({
             "completed_at": datetime.now().isoformat(),
