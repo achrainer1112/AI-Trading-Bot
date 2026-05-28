@@ -1,17 +1,7 @@
 """
 AI Trading Bot - Risk Manager (Production)
 ============================================
-Erweiterte Risikokontrollen:
-
-- Circuit Breaker (Intraday Loss, Drawdown, VIX, Market Halt)
-- Emergency Cash Mode (bei Überschreitung des maximalen Tagesverlusts)
-- VaR (Value at Risk) Berechnung und Limit
-- Volatility Targeting
-- Drawdown Protection
-- Dynamische Max-Trades (basierend auf VIX)
-- Sektor- und Faktor-Exposure Limits
-- Stop-Loss mit ATR-Option
-- Idempotente Entscheidungsauflösung
+Erweiterte Risikokontrollen mit adaptiver Confidence Engine.
 """
 
 from typing import Dict, List, Optional, Set, Tuple
@@ -24,6 +14,7 @@ from config import (
     FACTOR_CLASSIFICATION,
     ETF_SECTOR_WEIGHTS,
     ETF_FACTOR_WEIGHTS,
+    REGIME_CONFIDENCE_THRESHOLDS,
 )
 from utils import format_currency, zombie_registry, ensure_decision_ids
 
@@ -34,29 +25,15 @@ ETF_OVERLAP_GROUPS = [
 
 TOP_N_BUYS = 5
 
-# ─────────────────────────────────────────────────────────────
-# CIRCUIT BREAKER SYSTEM
-# ─────────────────────────────────────────────────────────────
 
 class CircuitBreaker:
-    """
-    Portfolio-level stress detection and automatic trading halts.
-    
-    Triggers:
-      - CB1: Intraday loss > 5% → STOP_ALL_BUYS (allow SELL only)
-      - CB2: Portfolio drawdown > 10% → REDUCE_EXPOSURE (50% smaller sizes)
-      - CB3: VIX spike > 35 → DE_RISK_50 (close 50% of long positions)
-      - CB4: Market halted → HALT_ALL (no trades)
-    """
-    
+    """Circuit Breaker System (unverändert)"""
     def __init__(self):
         self.triggered = False
         self.reason = None
         self.action = None
-    
+
     def check_all(self, portfolio: Dict, market_data: Dict) -> bool:
-        """Check all circuit breaker conditions. Returns True if ANY breaker is triggered."""
-        # CB1: Intraday Loss
         intraday_loss = market_data.get('intraday_loss_pct', 0.0)
         if intraday_loss < -0.05:
             self.triggered = True
@@ -64,8 +41,6 @@ class CircuitBreaker:
             self.action = 'STOP_ALL_BUYS'
             log.critical(f"🛑 CIRCUIT BREAKER 1 (Intraday Loss): {self.reason}")
             return True
-        
-        # CB2: Portfolio Drawdown (peak to current)
         drawdown = portfolio.get('drawdown_pct', 0.0)
         if drawdown < -0.10:
             self.triggered = True
@@ -73,8 +48,6 @@ class CircuitBreaker:
             self.action = 'REDUCE_EXPOSURE'
             log.critical(f"🛑 CIRCUIT BREAKER 2 (Drawdown): {self.reason}")
             return True
-        
-        # CB3: VIX Spike
         vix = market_data.get('vix', 20.0)
         if vix > 35:
             self.triggered = True
@@ -82,43 +55,29 @@ class CircuitBreaker:
             self.action = 'DE_RISK_50'
             log.critical(f"🛑 CIRCUIT BREAKER 3 (VIX Spike): {self.reason}")
             return True
-        
-        # CB4: Market Halted
         if market_data.get('market_halted', False):
             self.triggered = True
             self.reason = "Market circuit breaker triggered"
             self.action = 'HALT_ALL'
             log.critical(f"🛑 CIRCUIT BREAKER 4 (Market Halt): {self.reason}")
             return True
-        
-        # All clear
         self.triggered = False
         self.action = None
         return False
-    
+
     def get_action(self) -> str:
         return self.action or 'OK'
 
 
-# ─────────────────────────────────────────────────────────────
-# FINAL DECISION RESOLVER (unverändert, bleibt wie gehabt)
-# ─────────────────────────────────────────────────────────────
-
-FINAL_STATUS_SELL      = "SELL"
-FINAL_STATUS_BUY       = "BUY"
-FINAL_STATUS_HOLD      = "HOLD"
-FINAL_STATUS_SKIPPED   = "SKIPPED"
-FINAL_STATUS_REJECTED  = "REJECTED"
-
 class FinalDecisionResolver:
-    """Auflösung von Konflikten (mehrere Entscheidungen pro Ticker) mit Prioritäten."""
+    """Auflösung von Konflikten (unverändert)"""
     FORCED_EXIT_MARKERS = ("stop_loss", "zombie_cleanup", "forced_rebalancing")
     SELL_PRIORITY = {
-        "stop_loss":          100,
-        "zombie_cleanup":      90,
-        "forced_rebalancing":  80,
-        "rebalancing":         70,
-        "normal":              50,
+        "stop_loss": 100,
+        "zombie_cleanup": 90,
+        "forced_rebalancing": 80,
+        "rebalancing": 70,
+        "normal": 50,
     }
 
     def resolve(self, decisions: List[Dict]) -> List[Dict]:
@@ -128,7 +87,6 @@ class FinalDecisionResolver:
             if not t:
                 continue
             by_ticker.setdefault(t, []).append(d)
-
         resolved = []
         for ticker, candidates in by_ticker.items():
             if len(candidates) == 1:
@@ -143,7 +101,6 @@ class FinalDecisionResolver:
         sells = [c for c in candidates if c.get("action") == "SELL"]
         buys = [c for c in candidates if c.get("action") == "BUY" and c.get("risk_approved", False)]
         holds = [c for c in candidates if c.get("action") == "HOLD"]
-
         if forced_exits:
             forced_exits.sort(key=lambda c: self._forced_exit_priority(c), reverse=True)
             winner = forced_exits[0]
@@ -182,12 +139,7 @@ class FinalDecisionResolver:
         return self.SELL_PRIORITY.get(sell_type, 50)
 
 
-# ─────────────────────────────────────────────────────────────
-# RISK MANAGER HAUPTKLASSE
-# ─────────────────────────────────────────────────────────────
-
 class RiskManager:
-
     def __init__(self, risk_profile: RiskProfile = None):
         self.risk_profile = risk_profile or ACTIVE_RISK_PROFILE
         self.settings = RISK_SETTINGS[self.risk_profile].copy()
@@ -202,39 +154,103 @@ class RiskManager:
             f"Max Trades: {self.settings.get('max_trades_per_run', TOP_N_BUYS)}"
         )
 
-    # ─── EMERGENCY CASH MODE ──────────────────────────────────────────
+    # ========== ADAPTIVE CONFIDENCE ENGINE ==========
+    def get_adaptive_thresholds(
+        self,
+        regime_state,
+        vix: Optional[float] = None,
+        market_momentum: float = 0.0,
+        cash_pct: float = 1.0,
+        invested_pct: float = 0.0,
+    ) -> Dict[str, float]:
+        """
+        Berechnet dynamische Confidence-Thresholds basierend auf:
+        - Marktregime (Basis)
+        - VIX (Stressadjustment)
+        - Markt-Momentum
+        - Portfolio-Exposure (Cash/Investiert)
+        Returns: {"buy": float, "sell": float} (als Dezimal, 0-1)
+        """
+        # 1. Basis aus Regime
+        if regime_state is None:
+            regime = "SIDEWAYS"
+        else:
+            regime_val = getattr(regime_state, 'regime', None)
+            if regime_val is not None:
+                regime = regime_val.value.upper() if hasattr(regime_val, 'value') else str(regime_val).upper()
+            else:
+                regime = getattr(regime_state, 'label', 'SIDEWAYS').upper()
+        base = REGIME_CONFIDENCE_THRESHOLDS.get(regime, REGIME_CONFIDENCE_THRESHOLDS["SIDEWAYS"])
+        buy_threshold = base["buy_threshold"]
+        sell_threshold = base["sell_threshold"]
+
+        # 2. VIX-Anpassung
+        vix_adj_buy = 0.0
+        vix_adj_max_trades = 0
+        if vix is not None:
+            if vix > 35:
+                vix_adj_buy = 0.10
+                vix_adj_max_trades = -50   # Halbieren
+                log.info(f"VIX {vix:.1f} > 35 → BUY +10%, Max Trades halbiert")
+            elif vix > 25:
+                vix_adj_buy = 0.05
+                vix_adj_max_trades = -20
+                log.info(f"VIX {vix:.1f} > 25 → BUY +5%, Max Trades -20%")
+        buy_threshold += vix_adj_buy
+
+        # 3. Momentum-Anpassung
+        momentum_adj_buy = 0.0
+        momentum_adj_sell = 0.0
+        if market_momentum > 0.5:   # > 50% Momentum (sehr stark)
+            momentum_adj_buy = -0.03
+            log.info(f"Momentum {market_momentum:.1%} > 50% → BUY -3%")
+        elif market_momentum < -0.5:
+            momentum_adj_sell = -0.05
+            log.info(f"Momentum {market_momentum:.1%} < -50% → SELL -5%")
+        buy_threshold += momentum_adj_buy
+        sell_threshold += momentum_adj_sell
+
+        # 4. Portfolio Exposure Adjustment
+        if cash_pct < 0.08:   # Cash < 8%
+            buy_threshold += 0.05
+            log.info(f"Cash {cash_pct:.1%} < 8% → BUY +5%")
+        if invested_pct > 0.90:   # >90% investiert
+            # Neue BUYs nur mit >75% Confidence
+            if buy_threshold < 0.75:
+                buy_threshold = 0.75
+            log.info(f"Investiert {invested_pct:.1%} > 90% → BUY min 75%")
+
+        # 5. Safety Clamping
+        buy_threshold = max(0.45, min(0.85, buy_threshold))
+        sell_threshold = max(0.45, min(0.85, sell_threshold))
+
+        # Logging
+        log.info(f"Adaptive Thresholds: BUY={buy_threshold:.0%}, SELL={sell_threshold:.0%} "
+                 f"(Regime={regime}, VIX={vix or 'n/a'}, Momentum={market_momentum:.2f})")
+        return {"buy": buy_threshold, "sell": sell_threshold}
+
     def emergency_cash_mode(self, portfolio_summary: Dict, market_data: Dict) -> bool:
-        """
-        Prüft, ob der maximale Tagesverlust überschritten wurde.
-        Wenn ja, werden alle Positionen geschlossen und nur Cash gehalten.
-        """
-        max_daily_loss = self.settings.get("max_daily_loss_pct", 0.05)  # default 5%
+        max_daily_loss = self.settings.get("max_daily_loss_pct", 0.05)
         daily_pnl = portfolio_summary.get("daily_pnl_pct", 0.0)
         if daily_pnl < -max_daily_loss:
             log.critical(f"EMERGENCY CASH MODE: Daily loss {daily_pnl:.2%} < -{max_daily_loss:.2%}")
             return True
         return False
 
-    # ─── DYNAMISCHE MAX-TRADES (abhängig von VIX) ─────────────────────
-    def _dynamic_max_trades(self, market_data: Dict) -> int:
-        """Reduziert die Anzahl der maximalen Trades bei hoher Volatilität."""
+    def _dynamic_max_trades(self, market_data: Dict, vix_adj: int = 0) -> int:
         vix = market_data.get('vix', 20)
         base_max = self.settings.get("max_trades_per_run", TOP_N_BUYS)
         if vix > 30:
-            return max(1, base_max // 2)
+            base_max = max(1, base_max // 2)
         elif vix < 15:
-            return base_max
-        else:
-            return base_max
+            base_max = base_max
+        # Anwendung der VIX-Adjustierung (z.B. -50% bei VIX>35)
+        if vix_adj < 0:
+            factor = 1.0 + vix_adj / 100.0
+            base_max = max(1, int(base_max * factor))
+        return base_max
 
-    # ─── ATR-BASED STOP-LOSS ─────────────────────────────────────────
-    def calculate_dynamic_stop_loss(
-        self,
-        ticker: str,
-        avg_price: float,
-        market_data: Dict[str, Dict],
-        atr_multiplier: float = 2.5,
-    ) -> float:
+    def calculate_dynamic_stop_loss(self, ticker: str, avg_price: float, market_data: Dict, atr_multiplier: float = 2.5) -> float:
         import math
         ticker_data = market_data.get(ticker, {})
         annual_vol = ticker_data.get("volatility_annual", 0.20)
@@ -245,13 +261,7 @@ class RiskManager:
         fixed_stop = avg_price * (1 - fixed_stop_pct)
         return max(dynamic_stop, fixed_stop)
 
-    # ─── VOLATILITY-ADJUSTED POSITION SIZING ─────────────────────────
-    def volatility_adjusted_allocation(
-        self,
-        base_allocation: float,
-        asset_volatility_pct: float,
-        target_volatility: float = 0.15,
-    ) -> float:
+    def volatility_adjusted_allocation(self, base_allocation: float, asset_volatility_pct: float, target_volatility: float = 0.15) -> float:
         if asset_volatility_pct <= 0:
             asset_volatility_pct = 0.15
         scale = target_volatility / asset_volatility_pct
@@ -260,13 +270,11 @@ class RiskManager:
         max_position = self.settings.get("max_position_pct", 0.25)
         return min(adjusted, max_position)
 
-    # ─── REGIME ANPASSUNG ────────────────────────────────────────────
     def apply_regime(self, regime_state) -> None:
         from market_regime import apply_regime_to_risk_settings
         self.regime_state = regime_state
         self.settings = apply_regime_to_risk_settings(self._base_settings, regime_state)
 
-    # ─── SEKTOR / FAKTOR HELPER ─────────────────────────────────────
     def _sector_of(self, ticker: str) -> str:
         return SECTOR_CLASSIFICATION.get(ticker, "diversified")
 
@@ -286,22 +294,16 @@ class RiskManager:
                 exposure[sector] = exposure.get(sector, 0.0) + alloc
         return exposure
 
-    # ─── VALIDIERUNG DER ENTSCHEIDUNGEN (Hauptmethode) ───────────────
     def validate_decisions(
         self,
         decisions: List[Dict],
         portfolio_summary: Dict,
         market_data: Dict[str, Dict],
     ) -> Tuple[List[Dict], List[str]]:
-        """
-        Prüft und korrigiert alle KI-Entscheidungen.
-        Integriert Circuit Breaker, Emergency Cash Mode, dynamische Limits.
-        """
         warnings = []
         validated = []
         max_pos = self.settings["max_position_pct"]
         min_cash = self.settings["min_cash_pct"]
-        conf_threshold = self.settings["confidence_threshold"]
         max_sector = self.settings.get("max_sector_exposure", 0.45)
         max_factor = self.settings.get("max_factor_exposure", 0.60)
 
@@ -311,7 +313,7 @@ class RiskManager:
 
         decisions = ensure_decision_ids(decisions)
 
-        # ── CIRCUIT BREAKER CHECK ─────────────────────────────────────
+        # ── CIRCUIT BREAKER ──
         breaker = CircuitBreaker()
         if breaker.check_all(portfolio_summary, market_data):
             log.warning(f"Circuit Breaker Action: {breaker.get_action()}")
@@ -347,9 +349,8 @@ class RiskManager:
                 decisions = []
                 warnings.append(f"🛑 Circuit Breaker: HALT_ALL (all trades blocked). {breaker.reason}")
 
-        # ── EMERGENCY CASH MODE ───────────────────────────────────────
+        # ── EMERGENCY CASH MODE ──
         if self.emergency_cash_mode(portfolio_summary, market_data):
-            # Alle Positionen schließen
             for ticker, pos in positions.items():
                 if pos.get('quantity', 0) > 0:
                     decisions.append({
@@ -363,24 +364,65 @@ class RiskManager:
                     })
             warnings.append("🚨 EMERGENCY CASH MODE ACTIVATED: all positions liquidated")
 
-        # ─── UNGÜLTIGE SELLS FILTERN ──────────────────────────────────
-        decisions, sell_warnings = self._filter_invalid_sells(decisions, positions)
-        warnings.extend(sell_warnings)
+        # ── ADAPTIVE CONFIDENCE THRESHOLDS ──
+        # Ermittle benötigte Daten
+        spy_data = market_data.get("SPY", {})
+        market_momentum = spy_data.get("return_20d", 0.0) / 100.0   # als Dezimal
+        vix = market_data.get("vix", None)
+        cash_pct = portfolio_summary.get("cash_pct", 100.0) / 100.0
+        invested_pct = 1.0 - cash_pct
+        adaptive = self.get_adaptive_thresholds(
+            regime_state=self.regime_state,
+            vix=vix,
+            market_momentum=market_momentum,
+            cash_pct=cash_pct,
+            invested_pct=invested_pct,
+        )
+        buy_conf_threshold = adaptive["buy"]
+        sell_conf_threshold = adaptive["sell"]
 
-        # ─── REBALANCING SELLS GENERIEREN ─────────────────────────────
+        # Log für Journal (wird später in main.py aufgenommen)
+        self._last_adaptive_log = {
+            "buy_threshold": buy_conf_threshold,
+            "sell_threshold": sell_conf_threshold,
+            "vix": vix,
+            "vix_adjustment": (buy_conf_threshold - REGIME_CONFIDENCE_THRESHOLDS.get(
+                (self.regime_state.label if self.regime_state else "SIDEWAYS"), 
+                REGIME_CONFIDENCE_THRESHOLDS["SIDEWAYS"]
+            )["buy_threshold"]) if self.regime_state else 0,
+            "momentum": market_momentum,
+            "cash_pct": cash_pct,
+        }
+
+        # ─── UNGÜLTIGE SELLS FILTERN ──
+        filtered_sells = []
+        for d in decisions:
+            if d.get("action") == "SELL" and d["ticker"] not in positions:
+                is_special = d.get("zombie_cleanup") or d.get("stop_loss")
+                if not is_special:
+                    warnings.append(f"{d['ticker']}: SELL für nicht gehaltene Position → gefiltert")
+                continue
+            filtered_sells.append(d)
+        decisions = filtered_sells
+
+        # ── REBALANCING SELLS GENERIEREN ──
         rebalance_sells = self._generate_rebalancing_decisions(decisions, portfolio_summary)
         decisions = rebalance_sells + decisions
 
-        # ─── DYNAMISCHE MAX-TRADES ────────────────────────────────────
-        max_trades = self._dynamic_max_trades(market_data)
+        # ── DYNAMISCHE MAX-TRADES (mit VIX-Adjustierung) ──
+        vix_adj_pct = 0
+        if vix is not None:
+            if vix > 35:
+                vix_adj_pct = -50
+            elif vix > 25:
+                vix_adj_pct = -20
+        max_trades = self._dynamic_max_trades(market_data, vix_adj_pct)
 
-        # ─── WEITERE RISIKO-FILTER (Sektor, Faktor, Top-N) ────────────
         hold_decisions = [d for d in decisions if d.get("action") == "HOLD"]
         sell_decisions = [d for d in decisions if d.get("action") == "SELL"]
         buy_decisions = [d for d in decisions if d.get("action") == "BUY"]
 
         sector_exposure = self._sector_exposure(positions, total_value)
-        factor_exposure = {}  # vereinfacht
 
         for d in hold_decisions:
             d["risk_approved"] = True
@@ -394,16 +436,15 @@ class RiskManager:
             is_stop = d.get("stop_loss", False)
             is_forced = d.get("forced_rebalancing", False)
 
-            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < conf_threshold:
+            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
                 d = dict(d)
                 d["action"] = "HOLD"
-                d["reason"] += f" [RISK: Konfidenz {conf:.0%} zu niedrig]"
+                d["reason"] += f" [ADAPTIVE CONF: {conf:.0%} < SELL threshold {sell_conf_threshold:.0%}]"
                 d["risk_approved"] = False
                 validated.append(d)
                 warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD")
                 continue
 
-            # Cash aktualisieren
             pos_market_value = positions.get(ticker, {}).get("market_value", 0)
             target_alloc = d.get("target_allocation", 0)
             sell_value = (pos_market_value if target_alloc == 0.0
@@ -412,7 +453,7 @@ class RiskManager:
             d["risk_approved"] = True
             validated.append(d)
 
-        qualified = [d for d in buy_decisions if d.get("confidence", 0) >= conf_threshold]
+        qualified = [d for d in buy_decisions if d.get("confidence", 0) >= buy_conf_threshold]
         qualified.sort(key=lambda x: x.get("confidence", 0), reverse=True)
         top_buys = qualified[:max_trades]
         skip_buys = qualified[max_trades:]
@@ -425,16 +466,15 @@ class RiskManager:
             validated.append(d)
             warnings.append(f"{d['ticker']}: Max-Trades Limit → HOLD")
 
-        # BUYs mit Cash-Reserve validieren
         for d in top_buys:
             ticker = d.get("ticker", "?")
             target_alloc = d.get("target_allocation", 0)
             current_value = positions.get(ticker, {}).get("market_value", 0)
             buy_cost = max(0, total_value * target_alloc - current_value)
             cash_after = running_cash - buy_cost
-            cash_pct = cash_after / total_value if total_value > 0 else 0
+            cash_pct_after = cash_after / total_value if total_value > 0 else 0
 
-            if cash_pct < min_cash:
+            if cash_pct_after < min_cash:
                 max_spend = running_cash - (total_value * min_cash)
                 if max_spend >= 500:
                     reduced_target = (current_value + max_spend) / total_value
@@ -456,16 +496,14 @@ class RiskManager:
             d["risk_approved"] = True
             validated.append(d)
 
-        # Finale Cash-Invariante durchsetzen
+        # Finale Cash-Invariante
         validated, cash_warnings = self._enforce_cash_invariant(
             validated, total_value, running_cash, min_cash, positions, market_data
         )
         warnings.extend(cash_warnings)
 
-        # Konflikte auflösen
         validated = self._resolver.resolve(validated)
 
-        # Status setzen
         for d in validated:
             if d.get("action") in ("BUY", "SELL") and d.get("risk_approved", False):
                 d["status"] = "APPROVED"
@@ -482,19 +520,7 @@ class RiskManager:
         )
         return validated, warnings
 
-    # ─── HILFSMETHODEN ──────────────────────────────────────────────
-    def _filter_invalid_sells(self, decisions: List[Dict], positions: Dict) -> Tuple[List[Dict], List[str]]:
-        warnings = []
-        filtered = []
-        for d in decisions:
-            if d.get("action") == "SELL" and d["ticker"] not in positions:
-                is_special = d.get("zombie_cleanup") or d.get("stop_loss")
-                if not is_special:
-                    warnings.append(f"{d['ticker']}: SELL für nicht gehaltene Position → gefiltert")
-                continue
-            filtered.append(d)
-        return filtered, warnings
-
+    # ========== HILFSMETHODEN (unverändert) ==========
     def _generate_rebalancing_decisions(self, decisions: List[Dict], portfolio_summary: Dict) -> List[Dict]:
         total_value = portfolio_summary.get("total_value", 1)
         positions = portfolio_summary.get("positions", {})
@@ -536,7 +562,6 @@ class RiskManager:
         shortfall = min_cash_abs - projected_cash
         log.warning(f"[HARD GATE] Cash-Invariante verletzt! Fehlbetrag: {format_currency(shortfall)}")
 
-        # BUYs canceln (niedrigste Konfidenz zuerst)
         approved_buys = [d for d in validated if d.get("action") == "BUY" and d.get("risk_approved")]
         approved_buys.sort(key=lambda x: x.get("confidence", 0))
         recovered = projected_cash
@@ -554,7 +579,6 @@ class RiskManager:
         if recovered >= min_cash_abs:
             return validated, warnings
 
-        # Notfalls: SELLs generieren
         candidates = []
         for ticker, pos in positions.items():
             if any(d.get("ticker") == ticker and d.get("action") == "SELL" for d in validated):
@@ -563,7 +587,6 @@ class RiskManager:
             market_val = pos.get("market_value", 0)
             if market_val <= 0:
                 continue
-            # Priorität: hohe Allokation, schlechte Performance
             priority = current_alloc * (1 + max(0, -pos.get("unrealized_pnl_pct", 0) / 100))
             candidates.append({"ticker": ticker, "market_value": market_val, "priority": priority})
 
@@ -590,7 +613,6 @@ class RiskManager:
 
         return validated, warnings
 
-    # ─── STOP-LOSS ─────────────────────────────────────────────────
     def check_stop_loss(self, positions: Dict, market_data: Dict) -> List[Dict]:
         stop_loss_pct = self.settings["stop_loss_pct"]
         stop_loss_orders = []
@@ -613,19 +635,11 @@ class RiskManager:
                 })
         return stop_loss_orders
 
-    # ─── VAR BERECHNUNG ────────────────────────────────────────────
-    def calculate_portfolio_var(
-        self,
-        positions: Dict[str, Dict],
-        market_data: Dict[str, Dict],
-        total_value: float,
-        confidence: float = 0.95,
-    ) -> Dict:
+    def calculate_portfolio_var(self, positions: Dict, market_data: Dict, total_value: float, confidence: float = 0.95) -> Dict:
         import numpy as np
         from scipy.stats import norm
         if total_value <= 0 or not positions:
             return {"var_pct": 0.0, "var_usd": 0.0, "component_vars": {}}
-
         weights = []
         vols = []
         tickers = []
@@ -636,7 +650,6 @@ class RiskManager:
             weights.append(alloc)
             vols.append(vol_daily)
             tickers.append(ticker)
-
         w = np.array(weights)
         v = np.array(vols)
         portfolio_vol = float(np.sqrt(np.sum((w * v) ** 2)))
@@ -662,3 +675,7 @@ class RiskManager:
             "max_trades_per_run": self.settings.get("max_trades_per_run", TOP_N_BUYS),
             "confidence_threshold": self.settings["confidence_threshold"],
         }
+
+    def get_adaptive_log(self) -> Dict:
+        """Gibt die letzten adaptiven Thresholds fürs Journal zurück."""
+        return getattr(self, '_last_adaptive_log', {})
