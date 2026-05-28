@@ -163,7 +163,7 @@ SCORE_BUY_WITHOUT_GUARDRAIL = 60
 # ─────────────────────────────────────────────
 REBALANCING_ENGINE_ENABLED = True
 REBALANCING_MIN_DRIFT = 0.02          # 2% Mindestabweichung für Rebalancing
-REBALANCING_MAX_TRADES = 8            # Max. Trades pro Rebalancing
+REBALANCING_MAX_TRADES = 6            # Max. Trades pro Rebalancing
 REBALANCING_QUALITY_FOCUS = True      # Qualitätsgewichtung aktivieren
 
 # ─────────────────────────────────────────────
