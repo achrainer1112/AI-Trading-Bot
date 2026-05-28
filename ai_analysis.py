@@ -1,36 +1,14 @@
 """
 AI Trading Bot - KI-Analyse (LLM als INTERPRETATION-LAYER)
 ==================================================
-Neue Pipeline:
-  Indicators → ScoreEngine (IMMUTABLE) → LLM Interpretation → Risk Engine → Execution
+Neue Pipeline: ScoreEngine → PortfolioRebalancingEngine → LLM Interpretation → Risk Engine → Execution
 
 Das LLM (DECOUPLED):
-  - Empfängt deterministische Scores für jeden Ticker (IMMUTABLE)
-  - Interpretiert und erklärt die Scores (context nur)
+  - Empfängt deterministische Scores + Rebalancing-Vorschläge
+  - Interpretiert und erklärt die Portfolio-Optimierung
   - DARF KEINE Scores adjustieren (llm_score_adj immer = 0)
-  - Liefert STRUKTURIERTE JSON-Entscheidungen mit Metrik-Feldern
-  - Darf keine komplett irrationalen Entscheidungen erzeugen
-  - Narrativer Text ist OPTIONAL, Metriken sind PFLICHT
-
-Ausgabeformat je Entscheidung:
-{
-  "ticker": "NVDA",
-  "action": "BUY",
-  "target_allocation": 0.12,
-  "confidence": 0.82,
-  "quant_score": 78,
-  "llm_score_adj": 0,
-  "reasoning": {
-    "momentum_20d": 14.2,
-    "relative_strength": 1.31,
-    "rsi": 64,
-    "sma_distance_pct": 5.2,
-    "volatility": 28.1,
-    "regime": "BULL",
-    "current_alloc": 0.08
-  },
-  "reason": "Optional kurze narrative Begründung (max 20 Wörter)"
-}
+  - Liefert STRUKTURIERTE JSON-Entscheidungen
+  - Darf nicht von optimaler Allokation abweichen ohne starke Gründe
 """
 
 import json
@@ -66,10 +44,11 @@ PORTFOLIO-KONSTRUKTIONSPRINZIPIEN:
 2. Das Ziel ist ein Portfolio mit 3–8 Positionen, das risikoadjustierte Rendite maximiert.
 3. Keine Überkonzentration: max. 20% pro Asset, max. 45% pro Sektor.
 4. Mindestens 10% Cash-Reserve.
-5. Nutze Korrelationsbewusstsein: Vermeide stark korrelierte Assets gleichzeitig (z.B. QQQ und XLK).
+5. Nutze Korrelationsbewusstsein: Vermeide stark korrelierte Assets gleichzeitig.
 6. Weise jedem Asset eine Zielallokation zu (target_allocation). Nicht nur BUY/SELL.
 7. Die quantitativen Scores sind bereits berechnet (FINAL, nicht anpassbar). llm_score_adj muss 0 sein.
-8. Du darfst nur dann von der vorgeschlagenen Portfolio-Optimizer-Allokation abweichen, wenn starke makroökonomische Nachrichten dies rechtfertigen.
+8. Du erhältst einen Portfolio-Optimizer-Vorschlag (Rebalancing Engine). Diese Allokation ist bereits kosten- und risikooptimiert.
+9. Du darfst nur dann von diesem Vorschlag abweichen, wenn starke makroökonomische Nachrichten dies rechtfertigen.
 
 JSON-FORMAT (PFLICHT):
 {
@@ -100,12 +79,13 @@ JSON-FORMAT (PFLICHT):
   "feedback_learnings": "What you learned from past decisions"
 }
 
-WICHTIG: Denke in Portfolio-Allokationen. Jede Entscheidung muss zum Gesamtportfolio passen."""
+WICHTIG: Denke in Portfolio-Allokationen. Jede Entscheidung muss zum Gesamtportfolio passen. Der Rebalancing-Vorschlag ist deine Baseline – weiche nur ab, wenn starke Gründe vorliegen."""
 
 
 class AIAnalyzer:
     """
     KI-Analyse-Modul: LLM als INTERPRETATION-LAYER (nicht Score-Adjustment).
+    Verwendet den Portfolio-Optimizer (oder Rebalancing Engine) als Basis.
     """
 
     def __init__(self):
@@ -114,7 +94,7 @@ class AIAnalyzer:
         self.client = None
         self.risk_settings = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
 
-        # Portfolio-level optimizer (score-weighted, diversified allocation)
+        # Fallback: PortfolioOptimizer (wird nur verwendet, wenn keine Rebalancing Engine aktiv)
         self.portfolio_optimizer = PortfolioOptimizer(
             sector_map=SECTOR_CLASSIFICATION,
             correlation_groups=CORRELATION_GROUPS,
@@ -186,7 +166,7 @@ class AIAnalyzer:
         scores: Dict[str, ScoreBreakdown],
         journal_entries: List[Dict] = None,
         regime_state=None,
-        portfolio_allocation=None,  # PortfolioAllocation from PortfolioOptimizer
+        portfolio_allocation=None,  # Kann PortfolioAllocation oder MockAllocation sein
     ) -> str:
         prompt_parts = []
 
@@ -219,34 +199,43 @@ class AIAnalyzer:
             else:
                 prompt_parts.append("REGIME-ANWEISUNG: BULL. Momentum-Strategien funktionieren. Risiko beachten.")
 
-        # 3. Portfolio Optimizer Output (CORE – zuerst!)
-        if portfolio_allocation is None:
-            # Fallback: selbst berechnen (mit Regime-Parametern)
-            # Berechne Marktkonfidenz und Portfolio-Risiko
-            market_confidence = getattr(regime_state, 'confidence', 0.5) if regime_state else 0.5
-            # Einfache Portfolio-Risiko-Schätzung
-            positions = portfolio_summary.get("positions", {})
-            total_val = portfolio_summary.get("total_value", 100_000)
-            from config import SECTOR_CLASSIFICATION
-            tech_exposure = 0.0
-            for ticker, pos in positions.items():
-                sector = SECTOR_CLASSIFICATION.get(ticker, "other")
-                if sector == "tech":
-                    tech_exposure += pos.get("market_value", 0)
-            tech_exposure = tech_exposure / total_val if total_val > 0 else 0
-            portfolio_risk_high = tech_exposure > 0.5
-
-            portfolio_allocation = self.portfolio_optimizer.optimize(
-                scores=scores,
-                current_positions=positions,
-                total_value=total_val,
-                regime_state=regime_state,
-                market_confidence=market_confidence,
-                portfolio_risk_high=portfolio_risk_high,
-            )
-        prompt_parts.append(
-            "\n" + self.portfolio_optimizer.build_prompt_section(scores, portfolio_allocation)
-        )
+        # 3. Portfolio Optimizer / Rebalancing Engine Output (CORE)
+        if portfolio_allocation is not None:
+            prompt_parts.append("\n=== PORTFOLIO REBALANCING ENGINE VORSCHLAG (Baseline) ===")
+            prompt_parts.append(f"Target positions: {len(portfolio_allocation.target_allocations)}")
+            prompt_parts.append(f"Cash target: {portfolio_allocation.cash_target:.1%}")
+            if hasattr(portfolio_allocation, 'rationale') and portfolio_allocation.rationale:
+                prompt_parts.append(f"Rationale: {portfolio_allocation.rationale}")
+            prompt_parts.append("")
+            prompt_parts.append(f"{'Ticker':<8} {'TargetAlloc':>11}")
+            prompt_parts.append("-" * 25)
+            for ticker, alloc in sorted(portfolio_allocation.target_allocations.items(), key=lambda x: -x[1]):
+                prompt_parts.append(f"{ticker:<8} {alloc:>10.1%}")
+            prompt_parts.append("")
+            prompt_parts.append("Diese Allokation ist bereits kosten- und risikooptimiert. Weiche nur bei starken Gründen ab.")
+        else:
+            # Fallback: eigenen Optimizer verwenden
+            log.warning("Kein portfolio_allocation in build_prompt – verwende Fallback-Optimizer")
+            if scores:
+                current_positions = portfolio_summary.get("positions", {})
+                total_val = portfolio_summary.get("total_value", 100_000)
+                market_confidence = getattr(regime_state, 'confidence', 0.5) if regime_state else 0.5
+                tech_exposure = 0.0
+                for ticker, pos in current_positions.items():
+                    sector = SECTOR_CLASSIFICATION.get(ticker, "other")
+                    if sector == "tech":
+                        tech_exposure += pos.get("market_value", 0)
+                tech_exposure = tech_exposure / total_val if total_val > 0 else 0
+                portfolio_risk_high = tech_exposure > 0.5
+                fallback_allocation = self.portfolio_optimizer.optimize(
+                    scores=scores,
+                    current_positions=current_positions,
+                    total_value=total_val,
+                    regime_state=regime_state,
+                    market_confidence=market_confidence,
+                    portfolio_risk_high=portfolio_risk_high,
+                )
+                prompt_parts.append(self.portfolio_optimizer.build_prompt_section(scores, fallback_allocation))
 
         # 4. Quantitative Scores
         if scores:
@@ -268,10 +257,10 @@ class AIAnalyzer:
                     f"  {ticker}: {alloc:.1%} | P&L: {pos.get('unrealized_pnl_pct', 0):+.1f}%"
                 )
 
-        # 5b. Top Candidates summary (nur als Referenz)
+        # 5b. Top Candidates (Referenz)
         candidates = rank_candidates(scores, min_score=self.risk_settings.get("min_buy_score", 60), top_k=SCORE_TOP_K_CANDIDATES)
         if candidates:
-            prompt_parts.append("\n=== TOP BUY-KANDIDATEN (nach quantitativem Score) ===")
+            prompt_parts.append("\n=== HOCH BEWERTETE ASSETS (Referenz) ===")
             for c in candidates:
                 prompt_parts.append(f"  {c.to_llm_summary()}")
 
@@ -283,9 +272,9 @@ class AIAnalyzer:
         tickers_str = ", ".join(watchlist[:15])
         prompt_parts.append("\n=== AUFGABE ===")
         prompt_parts.append(
-            f"Erstelle ein PORTFOLIO basierend auf dem obigen Portfolio-Optimizer-Vorschlag.\n"
+            f"Erstelle ein PORTFOLIO basierend auf dem obigen Rebalancing-Vorschlag.\n"
             f"Du darfst die vorgeschlagenen Allokationen nur aus wichtigen Gründen anpassen (z.B. starke Nachrichten).\n"
-            f"Denke in Gesamtallokationen, nicht in einzelnen Trades. Antworte NUR mit JSON."
+            f"Denke in Gesamtallokationen. Antworte NUR mit JSON."
         )
 
         return "\n".join(prompt_parts)
@@ -298,6 +287,7 @@ class AIAnalyzer:
         watchlist: List[str],
         journal_entries: List[Dict] = None,
         regime_state=None,
+        portfolio_allocation=None,  # Wird von main.py übergeben (MockAllocation oder PortfolioAllocation)
     ) -> Dict:
         """
         Hauptfunktion: Score Engine → LLM Meta-Layer → validierte Entscheidungen.
@@ -315,31 +305,27 @@ class AIAnalyzer:
         for s in top:
             log.debug(f"  {s.ticker}: {s.total_score:.0f} ({s.signal}) | RSI={s.rsi} Mom={s.momentum_20d}")
 
-        # 2. Portfolio-level optimization (mit Score-Guardrails und Risikoparametern)
-        # Berechne Marktkonfidenz und Portfolio-Risiko
-        market_confidence = getattr(regime_state, 'confidence', 0.5) if regime_state else 0.5
-        # Portfolio-Risiko: hoch wenn Tech-Exposure > 50% oder Volatilität > 25%
-        from config import SECTOR_CLASSIFICATION
-        tech_exposure = 0.0
-        for ticker, pos in positions.items():
-            sector = SECTOR_CLASSIFICATION.get(ticker, "other")
-            if sector == "tech":
-                tech_exposure += pos.get("market_value", 0)
-        tech_exposure = tech_exposure / total_value if total_value > 0 else 0
-        portfolio_risk_high = tech_exposure > 0.5
-
-        portfolio_allocation = self.portfolio_optimizer.optimize(
-            scores=scores,
-            current_positions=positions,
-            total_value=total_value,
-            regime_state=regime_state,
-            market_confidence=market_confidence,
-            portfolio_risk_high=portfolio_risk_high,
-        )
-        log.info(
-            f"PortfolioOptimizer: {len(portfolio_allocation.target_allocations)} BUY targets | "
-            f"{len(portfolio_allocation.recommended_sells)} sells | cash={portfolio_allocation.cash_target:.1%}"
-        )
+        # 2. Falls kein portfolio_allocation übergeben wurde, berechne Fallback
+        if portfolio_allocation is None:
+            log.warning("Kein portfolio_allocation in analyze – verwende Fallback-Optimizer")
+            # Fallback mit Regime-Parametern
+            market_confidence = getattr(regime_state, 'confidence', 0.5) if regime_state else 0.5
+            from config import SECTOR_CLASSIFICATION
+            tech_exposure = 0.0
+            for ticker, pos in positions.items():
+                sector = SECTOR_CLASSIFICATION.get(ticker, "other")
+                if sector == "tech":
+                    tech_exposure += pos.get("market_value", 0)
+            tech_exposure = tech_exposure / total_value if total_value > 0 else 0
+            portfolio_risk_high = tech_exposure > 0.5
+            portfolio_allocation = self.portfolio_optimizer.optimize(
+                scores=scores,
+                current_positions=positions,
+                total_value=total_value,
+                regime_state=regime_state,
+                market_confidence=market_confidence,
+                portfolio_risk_high=portfolio_risk_high,
+            )
 
         if not self.client:
             log.warning("Kein OpenAI Client – nutze Score-basierte Fallback-Analyse.")
@@ -446,7 +432,7 @@ class AIAnalyzer:
                 d["llm_score_adj"] = 0.0
                 effective_score = quant_score
 
-                # Guardrail: BUY blockieren wenn Score zu niedrig – AUSSER wenn vom PortfolioOptimizer vorgeschlagen
+                # Guardrail: BUY blockieren wenn Score zu niedrig – AUSSER wenn vom PortfolioOptimizer/Rebalancing vorgeschlagen
                 is_optimizer_suggestion = ticker in optimizer_tickers
                 if d["action"] == "BUY" and effective_score < min_buy_score and not is_optimizer_suggestion:
                     log.warning(
@@ -500,7 +486,7 @@ class AIAnalyzer:
         total_value = portfolio_summary.get("total_value", 100_000)
 
         if portfolio_allocation is None:
-            # Fallback: Optimizer ohne Regime-Parameter aufrufen (Default-Werte)
+            # Fallback: Optimizer ohne Regime-Parameter aufrufen
             portfolio_allocation = self.portfolio_optimizer.optimize(
                 scores=scores,
                 current_positions=positions,
@@ -531,8 +517,8 @@ class AIAnalyzer:
             target_alloc = portfolio_allocation.target_allocations.get(ticker)
             if target_alloc is not None:
                 action = "BUY"
-                reason = f"Portfolio-optimized: {portfolio_allocation.rationale.get(ticker, '')}"
-            elif ticker in portfolio_allocation.recommended_sells:
+                reason = f"Portfolio-optimized: {portfolio_allocation.rationale.get(ticker, '') if hasattr(portfolio_allocation, 'rationale') else 'Rebalancing Engine'}"
+            elif ticker in getattr(portfolio_allocation, 'recommended_sells', []):
                 action = "SELL"
                 target_alloc = 0.0
                 reason = f"Score below hold threshold ({sb.total_score:.0f})"
@@ -554,7 +540,7 @@ class AIAnalyzer:
 
         return {
             "decisions": decisions,
-            "portfolio_rationale": portfolio_allocation.summary(),
+            "portfolio_rationale": getattr(portfolio_allocation, 'summary', lambda: "Fallback allocation")(),
             "market_outlook": "Fallback: portfolio-optimized score-based analysis (no LLM).",
             "risk_assessment": "Using PortfolioOptimizer allocation (risk-adjusted, diversified).",
             "scores": {t: sb.to_dict() for t, sb in scores.items()},
