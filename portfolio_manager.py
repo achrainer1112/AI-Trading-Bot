@@ -93,6 +93,18 @@ class PortfolioManager:
         try:
             account = self.alpaca_api.get_account()
             self.cash = float(account.cash)
+            
+            # Initialkapital auf den aktuellen Portfolio-Wert setzen,
+            # wenn es noch nicht korrekt ist
+            if self.initial_capital == INITIAL_CAPITAL or self.initial_capital > 10000:
+                self.initial_capital = float(account.portfolio_value)
+                log.info(f"Initial capital aktualisiert auf {format_currency(self.initial_capital)}")
+            else:
+                # Sonst initial_capital aus lokaler Datei lesen, falls vorhanden
+                local_data = load_json_file(self.portfolio_file, default=None)
+                if local_data and "initial_capital" in local_data:
+                    self.initial_capital = local_data["initial_capital"]
+
             positions = self.alpaca_api.list_positions()
             self.positions = {}
             for pos in positions:
