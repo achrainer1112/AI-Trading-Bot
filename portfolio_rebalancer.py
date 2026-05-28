@@ -1,19 +1,24 @@
 """
-portfolio_rebalancer.py – Integration des Continuous Portfolio Optimizer
+portfolio_rebalancer.py – Integration des Continuous Portfolio Optimizer (CPO)
 """
 
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
 from logger import log
-from config import ACTIVE_RISK_PROFILE, REBALANCING_ENGINE_ENABLED, REBALANCING_MAX_TRADES
+from config import (
+    ACTIVE_RISK_PROFILE,
+    REBALANCING_ENGINE_ENABLED,
+    REBALANCING_MAX_TRADES,
+    SECTOR_CLASSIFICATION,
+)
 from cpo_engine import ContinuousPortfolioOptimizer
 
 
 @dataclass
 class RebalancingDecision:
     ticker: str
-    action: str
+    action: str          # BUY, SELL, HOLD
     target_weight: float
     confidence: float
     reason: str
@@ -38,12 +43,12 @@ class PortfolioRebalancer:
         if not self.enabled:
             return [], current_weights, cash / max(total_value, 1), ""
 
-        # Extrahiere benötigte Felder aus market_data
+        # Extrahiere Konfidenz, Momentum, Volatilität aus Scores/Market Data
         confidences = {}
         momentums = {}
         volatilities = {}
         for ticker, data in market_data.items():
-            # Confidenz aus Score (vereinfacht)
+            # Confidence: vorerst aus Score (kann später durch AI-Konfidenz ersetzt werden)
             sc = scores.get(ticker, 50.0)
             confidences[ticker] = sc / 100.0
             momentums[ticker] = data.get("return_20d", 0.0)
@@ -86,7 +91,7 @@ class PortfolioRebalancer:
                 reason=f"Target {target:.1%} vs current {current:.1%}",
             ))
 
-        # Begrenzen auf max_trades (optional)
+        # Begrenzen auf max_trades (optional, kann auch entfallen)
         decisions = decisions[:self.max_trades]
 
         log.info(f"PortfolioRebalancer (CPO): {len(decisions)} Trades, Cash-Ziel {cash_target:.1%}")
