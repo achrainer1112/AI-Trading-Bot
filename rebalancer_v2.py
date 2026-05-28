@@ -196,7 +196,6 @@ class RebalancerV2:
         # Core: Mindestens 30% des investierbaren Kapitals (wenn vorhanden)
         core_weight_total = min(0.5, len(core_edges) * 0.15) if core_edges else 0.0
         
-        # Verteilung auf Core nach Edge
         core_weights = {}
         if core_edges:
             total_core_edge = sum(e.adjusted_edge + 0.5 for e in core_edges.values())
@@ -207,6 +206,7 @@ class RebalancerV2:
         
         # Rest für Tactical
         tactical_budget = total_investable - sum(core_weights.values())
+        tactical_weights = {}   # 🔥 FIX: Variable definieren
         if tactical_budget > 0 and tactical_edges:
             total_tactical_edge = sum(e.adjusted_edge + 0.2 for e in tactical_edges.values())
             if total_tactical_edge > 0:
@@ -215,10 +215,9 @@ class RebalancerV2:
                     tactical_weights[t] = min(self.max_position_pct, raw)
             else:
                 tactical_weights = {t: 0.0 for t in tactical_edges}
-        else:
-            tactical_weights = {}
         
         return {**core_weights, **tactical_weights}
+
     
     def identify_swap_candidates(
         self,
