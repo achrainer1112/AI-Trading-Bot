@@ -1,12 +1,6 @@
 """
-AI Trading Bot - Konfigurationsdatei (erweitert für Rebalancing Engine)
-==================================================
-Neue Parameter:
-  - TRANSACTION_COST_MODEL
-  - MIN_TRADE_IMPROVEMENT (Mindestverbesserung für Trade)
-  - MAX_ANNUAL_TURNOVER (Jährlicher Umschlag)
-  - REBALANCING_DRIFT_THRESHOLD (Rebalancing nur bei signifikanter Abweichung)
-  - SWAP_MIN_SCORE_DIFF (Mindest-Score-Differenz für Swap)
+AI Trading Bot - Konfigurationsdatei (erweitert)
+=================================================
 """
 
 import os
@@ -32,7 +26,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# RISIKOPROFILE
+# RISIKOPROFILE (unverändert)
 # ─────────────────────────────────────────────
 class RiskProfile(Enum):
     CONSERVATIVE = "conservative"
@@ -60,10 +54,6 @@ RISK_SETTINGS = {
         "max_daily_loss_pct": 0.03,
         "max_intraday_loss_pct": 0.05,
         "vix_panic_threshold": 30.0,
-        # Neue Parameter für Rebalancing Engine
-        "max_annual_turnover": 2.0,          # 200% jährlicher Umschlag (bei 200 Tagen = 1% pro Tag)
-        "rebalancing_drift_threshold": 0.03,  # 3% Abweichung löst Rebalancing aus
-        "min_trade_improvement": 0.005,       # 0.5% Mindestverbesserung für Trade
     },
     RiskProfile.BALANCED: {
         "max_position_pct": 0.20,
@@ -85,10 +75,6 @@ RISK_SETTINGS = {
         "max_daily_loss_pct": 0.05,
         "max_intraday_loss_pct": 0.07,
         "vix_panic_threshold": 35.0,
-        # Neue Parameter
-        "max_annual_turnover": 3.0,           # 300% jährlich (etwas aktiver)
-        "rebalancing_drift_threshold": 0.02,  # 2% Abweichung
-        "min_trade_improvement": 0.003,       # 0.3% Mindestverbesserung
     },
     RiskProfile.AGGRESSIVE: {
         "max_position_pct": 0.30,
@@ -110,64 +96,62 @@ RISK_SETTINGS = {
         "max_daily_loss_pct": 0.08,
         "max_intraday_loss_pct": 0.10,
         "vix_panic_threshold": 40.0,
-        # Neue Parameter
-        "max_annual_turnover": 5.0,
-        "rebalancing_drift_threshold": 0.01,  # 1% Abweichung (aktiver)
-        "min_trade_improvement": 0.002,       # 0.2% Mindestverbesserung
     },
 }
 
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 
 # ─────────────────────────────────────────────
-# TRANSACTION COST MODELL
+# REGIME-AWARE RISK ENGINE (NEU)
 # ─────────────────────────────────────────────
-TRANSACTION_COST_MODEL = {
-    "base_spread_bps": 10.0,          # 10 Basispunkte Spread (0.1%)
-    "impact_factor": 0.5,              # Markteinfluss-Faktor
-    "min_cost_usd": 1.0,              # Mindestkosten pro Trade in USD
-    "fixed_fee_usd": 0.0,             # Feste Gebühr pro Trade (z.B. Broker)
+REGIME_CONFIDENCE_THRESHOLDS = {
+    "BULL": {
+        "buy_threshold": 0.55,
+        "sell_threshold": 0.70,
+    },
+    "SIDEWAYS": {
+        "buy_threshold": 0.65,
+        "sell_threshold": 0.65,
+    },
+    "BEAR": {
+        "buy_threshold": 0.75,
+        "sell_threshold": 0.55,
+    },
+}
+
+VOLATILITY_MULTIPLIERS = {
+    "very_low": {"max_vol": 15.0, "multiplier": 1.2},
+    "low":      {"max_vol": 25.0, "multiplier": 1.0},
+    "medium":   {"max_vol": 40.0, "multiplier": 0.7},
+    "high":     {"max_vol": 100.0, "multiplier": 0.4},
+}
+
+MOMENTUM_BOOST_ENABLED = True
+MOMENTUM_BOOST_FACTOR = 1.2
+MOMENTUM_STRENGTH_THRESHOLD = 10.0  # in Prozent (10% Momentum)
+
+CORRELATION_CLUSTERS = [
+    {"name": "mega_tech", "tickers": ["AAPL", "MSFT", "NVDA", "AMD", "QQQ", "XLK"]},
+    {"name": "financial", "tickers": ["JPM", "V", "MA", "XLF"]},
+    {"name": "healthcare", "tickers": ["XLV"]},
+    {"name": "defensive", "tickers": ["SPY", "VT"]},
+]
+
+MAX_CLUSTER_EXPOSURE = {
+    "mega_tech": 0.35,
+    "financial": 0.25,
+    "healthcare": 0.20,
+    "defensive": 0.50,
+}
+
+CASH_TARGET_BY_REGIME = {
+    "BULL": 0.07,
+    "SIDEWAYS": 0.15,
+    "BEAR": 0.30,
 }
 
 # ─────────────────────────────────────────────
-# CAPITAL ROTATION & SWAP LOGIC
-# ─────────────────────────────────────────────
-CAPITAL_ROTATION_ENABLED = True
-CAPITAL_ROTATION_MIN_SCORE_DIFF = 15.0
-CAPITAL_ROTATION_MAX_PER_RUN = 2
-CAPITAL_ROTATION_MIN_VALUE_USD = 100.0
-CAPITAL_ROTATION_MIN_HOLD_DAYS = 5
-
-# SWAP: Mindest-Score-Differenz für einen Austausch (wenn Cash knapp)
-SWAP_MIN_SCORE_DIFF = 12.0
-SWAP_MIN_MOMENTUM_ADVANTAGE = 5.0   # 5% Momentum-Vorteil
-
-# ─────────────────────────────────────────────
-# DYNAMIC POSITION SIZING
-# ─────────────────────────────────────────────
-DYNAMIC_POSITION_SIZING_ENABLED = True
-VOLATILITY_TARGET = 0.15
-MAX_VOLATILITY_FACTOR = 2.0
-MIN_VOLATILITY_FACTOR = 0.5
-
-# ─────────────────────────────────────────────
-# SCORE GUARDRAILS
-# ─────────────────────────────────────────────
-SCORE_GUARDRAIL_STRICT = True
-SCORE_MIN_FOR_BUY = 50
-SCORE_MIN_FOR_BUY_BEAR = 65
-SCORE_BUY_WITHOUT_GUARDRAIL = 60
-
-# ─────────────────────────────────────────────
-# REBALANCING ENGINE
-# ─────────────────────────────────────────────
-REBALANCING_ENGINE_ENABLED = True
-REBALANCING_MIN_DRIFT = 0.02          # 2% Mindestabweichung für Rebalancing
-REBALANCING_MAX_TRADES = 6            # Max. Trades pro Rebalancing
-REBALANCING_QUALITY_FOCUS = True      # Qualitätsgewichtung aktivieren
-
-# ─────────────────────────────────────────────
-# WATCHLIST & ETFs
+# WEITERE KONSTANTEN (unverändert)
 # ─────────────────────────────────────────────
 ETF_WATCHLIST = ["SPY", "QQQ", "VT"]
 SECTOR_ETFS = ["XLV", "XLF", "XLE", "XLK"]
@@ -180,11 +164,6 @@ SECTOR_CLASSIFICATION = {
     "V": "financial", "MA": "financial", "JPM": "financial",
     "XLV": "healthcare", "XLF": "financial", "XLE": "energy",
     "SPY": "diversified", "VT": "diversified",
-}
-
-FACTOR_CLASSIFICATION = {
-    "QQQ": "tech", "XLK": "tech", "XLV": "healthcare", "XLF": "financial",
-    "XLE": "energy", "SPY": "diversified", "VT": "diversified",
 }
 
 CORRELATION_GROUPS = [
@@ -202,7 +181,6 @@ ETF_SECTOR_WEIGHTS = {
     "XLF": {"financial": 0.80, "diversified": 0.20},
     "XLE": {"energy": 0.80, "diversified": 0.20},
 }
-ETF_FACTOR_WEIGHTS = ETF_SECTOR_WEIGHTS
 
 # ─────────────────────────────────────────────
 # PORTFOLIO EINSTELLUNGEN
@@ -211,30 +189,30 @@ PORTFOLIO_FILE = "portfolio.json"
 TRADE_LOG_FILE = "logs/trades.json"
 PORTFOLIO_HISTORY_FILE = "logs/portfolio_history.json"
 LOG_DIR = "logs"
-
 INITIAL_CAPITAL = 100_000.0
-MIN_ORDER_VALUE = 10.0          # reduziert für kleine Konten (Alpaca fractional shares)
+MIN_ORDER_VALUE = 10.0
 
 # ─────────────────────────────────────────────
-# SCORE ENGINE
+# REBALANCING
 # ─────────────────────────────────────────────
-DEFAULT_MIN_BUY_SCORE = 60
-SCORE_TOP_K_CANDIDATES = 8
-LLM_SCORE_OVERRIDE_LIMIT = 15
+REBALANCING_ENGINE_ENABLED = True
+REBALANCING_MAX_TRADES = 5
+REBALANCING_MIN_DRIFT = 0.02
+TRADE_FRICTION_PCT = 0.001
 
 # ─────────────────────────────────────────────
-# REBALANCING / TRADE FRICTION
+# BACKTESTING
 # ─────────────────────────────────────────────
-TRADE_FRICTION_PCT = 0.001        # 0.1% (10 Basispunkte)
-TAX_ESTIMATE_PCT = 0.0
-DEFAULT_ASSET_COOLDOWN_DAYS = 2
-COOLDOWN_FILE = "logs/trade_cooldowns.json"
+BACKTEST_START_DATE = "2022-01-01"
+BACKTEST_END_DATE = "2024-01-01"
+BACKTEST_INITIAL_CAPITAL = 100_000.0
+BACKTEST_COMMISSION = 0.001
 
 # ─────────────────────────────────────────────
-# PERFORMANCE TRACKING
+# DASHBOARD
 # ─────────────────────────────────────────────
-PERFORMANCE_FILE = "logs/performance_stats.json"
-SIGNAL_STATS_FILE = "logs/signal_stats.json"
+DASHBOARD_PORT = 8501
+ENABLE_DASHBOARD = True
 
 # ─────────────────────────────────────────────
 # SCHEDULER
@@ -259,17 +237,3 @@ NEWS_TOPICS = [
     "inflation", "interest rates", "recession", "tech stocks",
     "energy prices", "federal reserve", "earnings", "GDP"
 ]
-
-# ─────────────────────────────────────────────
-# BACKTESTING
-# ─────────────────────────────────────────────
-BACKTEST_START_DATE = "2022-01-01"
-BACKTEST_END_DATE = "2024-01-01"
-BACKTEST_INITIAL_CAPITAL = 100_000.0
-BACKTEST_COMMISSION = 0.001
-
-# ─────────────────────────────────────────────
-# DASHBOARD
-# ─────────────────────────────────────────────
-DASHBOARD_PORT = 8501
-ENABLE_DASHBOARD = True
