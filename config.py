@@ -251,3 +251,9 @@ NEWS_TOPICS = [
     "inflation", "interest rates", "recession", "tech stocks",
     "energy prices", "federal reserve", "earnings", "GDP"
 ]
+
+
+# ===== CVaR (Conditional Value at Risk) Risk Management =====
+CVAR_LIMIT_PCT = 0.05          # 5% maximaler Expected Shortfall (Tail Risk)
+CVAR_CONFIDENCE_LEVEL = 0.95   # 95% Konfidenzniveau für VaR/CVaR
+CVAR_LOOKBACK_DAYS = 252       # 252 Tage historische Daten (1 Handelsjahr)
