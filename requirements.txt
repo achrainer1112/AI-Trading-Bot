@@ -31,3 +31,6 @@ plotly>=5.20.0
 
 # Development (optional)
 python-dotenv>=1.0.0
+
+# News
+feedparser>=6.0.0
