@@ -241,6 +241,19 @@ class MarketDataCollector:
             "last_updated": datetime.now().isoformat(),
         }
 
+
+    def get_historical_returns(self, tickers: List[str], days: int = 252) -> Dict[str, np.ndarray]:
+        """Gibt historische tägliche Renditen als numpy arrays zurück."""
+        import numpy as np
+        returns = {}
+        for ticker in tickers:
+            df = self.fetch_price_history(ticker, days=days + 10)
+            if df is not None and len(df) > days:
+                close = df["Close"]
+                rets = close.pct_change().dropna().values[-days:]
+                returns[ticker] = rets
+        return returns
+
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> Optional[float]:
         if len(prices) < period + 1:
             return None
