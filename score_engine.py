@@ -1,15 +1,14 @@
 """
-AI Trading Bot - Quantitative Score Engine (robust, ohne Warnungen)
-===================================================================
+AI Trading Bot - Quantitative Score Engine (ultimativ robust)
+==============================================================
 """
 
 import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 from logger import log
 from config import SECTOR_CLASSIFICATION, CORRELATION_GROUPS, RISK_SETTINGS, ACTIVE_RISK_PROFILE
-
 
 SCORE_STRONG_BUY = 75
 SCORE_BUY = 60
@@ -61,7 +60,6 @@ class ScoreBreakdown:
                 "volatility": self.volatility_annual,
                 "current_price": self.current_price,
                 "current_alloc": round(self.current_alloc, 4),
-                "sma_distance_pct": self.sma_distance_pct,
             }
         }
 
@@ -81,35 +79,27 @@ class ScoreEngine:
         self.positions = positions or {}
         self.total_value = total_value
 
-    def score_all(
-        self,
-        market_data: Dict[str, Dict],
-        regime_state=None,
-        ai_scores: Dict[str, float] = None,
-        sentiment_scores: Dict[str, float] = None,
-    ) -> Dict[str, ScoreBreakdown]:
+    def score_all(self, market_data: Dict, regime_state=None, ai_scores=None, sentiment_scores=None) -> Dict[str, ScoreBreakdown]:
         results = {}
+        ai_scores = ai_scores or {}
+        sentiment_scores = sentiment_scores or {}
         for ticker, data in market_data.items():
-            # Nur Dictionaries verarbeiten, keine floats oder andere Typen
+            # CRITICAL: Prüfe, ob data ein dict ist
             if not isinstance(data, dict):
-                log.debug(f"ScoreEngine: Überspringe {ticker} (kein dict, Typ={type(data)})")
+                log.warning(f"ScoreEngine: Überspringe {ticker}, data ist {type(data)} (kein Dict) – verwende Dummy")
+                dummy = ScoreBreakdown(ticker=ticker, total_score=50.0, signal="HOLD", recommended_action="HOLD")
+                results[ticker] = dummy
                 continue
             try:
                 sb = self._calculate_score(ticker, data, regime_state, ai_scores, sentiment_scores)
                 results[ticker] = sb
             except Exception as e:
-                log.warning(f"ScoreEngine Fehler bei {ticker}: {e}")
+                log.warning(f"ScoreEngine Fehler bei {ticker}: {e} – verwende Dummy")
+                dummy = ScoreBreakdown(ticker=ticker, total_score=50.0, signal="HOLD", recommended_action="HOLD")
+                results[ticker] = dummy
         return results
 
-    def _calculate_score(
-        self,
-        ticker: str,
-        data: Dict,
-        regime_state=None,
-        ai_scores: Dict[str, float] = None,
-        sentiment_scores: Dict[str, float] = None,
-    ) -> ScoreBreakdown:
-        # Sichere Extraktion mit Defaults
+    def _calculate_score(self, ticker: str, data: Dict, regime_state, ai_scores, sentiment_scores) -> ScoreBreakdown:
         current_price = data.get("current_price", 0.0) or 0.0
         rsi = data.get("rsi_14")
         return_20d = data.get("return_20d") or data.get("return_30d") or 0.0
@@ -125,10 +115,10 @@ class ScoreEngine:
         current_alloc = pos.get("market_value", 0.0) / self.total_value if self.total_value > 0 else 0.0
 
         quant_score = self._quant_score(data)
-        ai_conf = (ai_scores or {}).get(ticker, 0.5)
+        ai_conf = ai_scores.get(ticker, 0.5)
         ai_score = ai_conf * 100
         momentum_score = self._momentum_score(return_20d)
-        sentiment = (sentiment_scores or {}).get(ticker, 0.0)
+        sentiment = sentiment_scores.get(ticker, 0.0)
         sentiment_score = (sentiment + 1) * 50
         risk_penalty = self._risk_penalty(volatility, rsi, current_alloc)
 
@@ -243,7 +233,7 @@ def rank_candidates(scores: Dict[str, ScoreBreakdown], min_score: float = SCORE_
 def build_score_prompt_section(scores: Dict[str, ScoreBreakdown]) -> str:
     if not scores:
         return ""
-    lines = ["=== QUANTITATIVE SCORES (deterministisch, vor KI-Interpretation) ==="]
+    lines = ["=== QUANTITATIVE SCORES ==="]
     lines.append(f"{'Ticker':<8} {'Score':>6} {'Signal':<12} {'RSI':>5} {'Mom20d':>8} {'Vola':>7} {'Alloc':>7}")
     lines.append("-" * 60)
     for ticker, sb in sorted(scores.items(), key=lambda x: x[1].total_score, reverse=True):
@@ -251,12 +241,9 @@ def build_score_prompt_section(scores: Dict[str, ScoreBreakdown]) -> str:
         mom_str = f"{sb.momentum_20d:+.1f}%" if sb.momentum_20d is not None else "n/a"
         vola_str = f"{sb.volatility_annual:.0f}%" if sb.volatility_annual is not None else "n/a"
         alloc_str = f"{sb.current_alloc:.1%}"
-        lines.append(
-            f"{ticker:<8} {sb.total_score:>6.1f} {sb.signal:<12} "
-            f"{rsi_str:>5} {mom_str:>8} {vola_str:>7} {alloc_str:>7}"
-        )
+        lines.append(f"{ticker:<8} {sb.total_score:>6.1f} {sb.signal:<12} {rsi_str:>5} {mom_str:>8} {vola_str:>7} {alloc_str:>7}")
     lines.append("")
-    lines.append("Scoring-Legende: >75=STRONG_BUY | 60-75=BUY | 45-60=HOLD | 30-45=REDUCE | <30=SELL")
+    lines.append("Legende: >75=STRONG_BUY | 60-75=BUY | 45-60=HOLD | 30-45=REDUCE | <30=SELL")
     return "\n".join(lines)
 
 
@@ -277,7 +264,7 @@ class PortfolioAllocation:
 
 
 class PortfolioOptimizer:
-    def __init__(self, sector_map: Dict[str, str] = None, correlation_groups: List[List[str]] = None, risk_settings: Dict = None):
+    def __init__(self, sector_map=None, correlation_groups=None, risk_settings=None):
         self.sector_map = sector_map or SECTOR_CLASSIFICATION
         self.correlation_groups = correlation_groups or CORRELATION_GROUPS
         self.risk_settings = risk_settings or RISK_SETTINGS[ACTIVE_RISK_PROFILE]
@@ -286,15 +273,8 @@ class PortfolioOptimizer:
         self.max_sector_pct = self.risk_settings.get("max_sector_exposure", 0.45)
         self.min_score_for_buy = self.risk_settings.get("min_buy_score", 60)
 
-    def optimize(
-        self,
-        scores: Dict[str, ScoreBreakdown],
-        current_positions: Dict[str, Dict] = None,
-        total_value: float = 100_000.0,
-        regime_state=None,
-        market_confidence: float = 0.5,
-        portfolio_risk_high: bool = False,
-    ) -> PortfolioAllocation:
+    def optimize(self, scores: Dict[str, ScoreBreakdown], current_positions=None, total_value=100_000.0,
+                 regime_state=None, market_confidence=0.5, portfolio_risk_high=False) -> PortfolioAllocation:
         candidates = []
         for ticker, sb in scores.items():
             if sb.total_score >= self.min_score_for_buy:
