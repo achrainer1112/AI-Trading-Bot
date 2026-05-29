@@ -1,27 +1,20 @@
 """
 AI Trading Bot - Utilities (FULL VERSION)
 ==========================================
-Enthält alle Hilfsfunktionen, Klassen und Dekorateure:
-
-- JSON-Helper
-- Marktzeit-Funktionen
-- ZombieRegistry (verhindert Wiederholungskäufe nach Liquidation)
-- CooldownManager (verhindert zu häufige Trades pro Asset)
-- TradeDeduplicator (doppelte Order-IDs)
-- Statistik-Funktionen (Sharpe, Max Drawdown, etc.)
-- Formatierungen
-- Normalisierungsfunktionen für AI-Entscheidungen
+Enthält alle Hilfsfunktionen, Klassen und Dekorateure.
+Neu: ZombieRegistry mit Mindestalter, Konsistenzprüfungen, CooldownManager.
 """
 
 import json
 import hashlib
 import os
-from datetime import datetime, time, date as _date
+from datetime import datetime, time, date as _date, timedelta
 from typing import Dict, Any, Optional, List, Set, Tuple
 import pytz
 import numpy as np
 
 from logger import log
+
 
 # ─────────────────────────────────────────────────────────────
 # JSON HELPERS
@@ -71,13 +64,17 @@ def market_status() -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# ZOMBIE SYSTEM
+# ZOMBIE SYSTEM (überarbeitet mit Mindestalter)
 # ─────────────────────────────────────────────────────────────
 
-ZOMBIE_POSITION_THRESHOLD = 50.0  # USD
+ZOMBIE_POSITION_THRESHOLD = 50.0      # USD
+ZOMBIE_MIN_AGE_DAYS = 7              # Position muss mindestens 7 Tage alt sein
+ZOMBIE_MIN_RUNS = 5                  # oder 5 Runs alt
 
 class ZombieRegistry:
-    """Verhindert, dass liquidierte Zombie-Positionen wieder gekauft werden."""
+    """Verhindert, dass liquidierte Zombie-Positionen wieder gekauft werden.
+       Neu: Zombie-Status nur nach Mindestalter oder Mindestanzahl Runs.
+    """
     REGISTRY_FILE = "logs/zombie_registry.json"
     STATUS_PENDING = "PENDING"
     STATUS_SELL_EXECUTED = "SELL_EXECUTED"
@@ -93,7 +90,18 @@ class ZombieRegistry:
     def _persist(self):
         save_json_file(self.REGISTRY_FILE, self._data)
 
-    def mark_zombie(self, ticker: str, market_value: float, reason: str = ""):
+    def mark_zombie(self, ticker: str, market_value: float, entry_date: str = None, reason: str = ""):
+        """Markiert eine Position als Zombie, aber nur wenn sie alt genug ist."""
+        # Prüfe Alter (falls entry_date vorhanden)
+        if entry_date:
+            try:
+                entry_dt = datetime.fromisoformat(entry_date)
+                age_days = (datetime.now() - entry_dt).days
+                if age_days < ZOMBIE_MIN_AGE_DAYS:
+                    log.debug(f"{ticker}: zu jung ({age_days} Tage) → nicht als Zombie markiert")
+                    return
+            except Exception:
+                pass
         if ticker not in self._data:
             self._data[ticker] = {
                 "status": self.STATUS_PENDING,
@@ -102,7 +110,7 @@ class ZombieRegistry:
                 "marked_at": datetime.now().isoformat(),
             }
             self._persist()
-            log.info(f"[ZombieRegistry] {ticker} als Zombie markiert (Wert: ${market_value:.2f})")
+            log.info(f"[ZombieRegistry] {ticker} als Zombie markiert (Wert: ${market_value:.2f}, Alter ok)")
 
     def get_status(self, ticker: str):
         return self._data.get(ticker, {}).get("status")
@@ -120,9 +128,21 @@ def find_zombie_positions(positions: Dict, threshold: float = ZOMBIE_POSITION_TH
     zombies = []
     for ticker, pos in positions.items():
         value = pos.get("market_value", 0)
+        entry_date = pos.get("entry_date")
+        # Nur wenn Wert unter Threshold UND Position alt genug
         if 0 < value < threshold:
+            # Prüfe Alter (falls vorhanden)
+            if entry_date:
+                try:
+                    entry_dt = datetime.fromisoformat(entry_date)
+                    age_days = (datetime.now() - entry_dt).days
+                    if age_days < ZOMBIE_MIN_AGE_DAYS:
+                        log.debug(f"{ticker}: Wert {value:.2f} unter Threshold, aber zu jung ({age_days} Tage) → kein Zombie")
+                        continue
+                except Exception:
+                    pass
             zombies.append(ticker)
-            zombie_registry.mark_zombie(ticker, value, "below threshold")
+            zombie_registry.mark_zombie(ticker, value, entry_date, "below threshold")
     return zombies
 
 
@@ -135,7 +155,7 @@ def build_zombie_sell_orders(zombie_tickers: List[str], positions: Dict) -> List
                 "action": "SELL",
                 "target_allocation": 0.0,
                 "confidence": 1.0,
-                "reason": "Zombie liquidation (value below threshold)",
+                "reason": f"Zombie liquidation (value below {ZOMBIE_POSITION_THRESHOLD}, age >= {ZOMBIE_MIN_AGE_DAYS}d)",
                 "risk_approved": True,
                 "zombie_cleanup": True,
             })
@@ -190,10 +210,6 @@ class TradeDeduplicator:
 # ─────────────────────────────────────────────────────────────
 
 class CooldownManager:
-    """
-    Verwaltet Cooldowns pro Asset.
-    Verhindert zu häufige Trades auf demselben Ticker.
-    """
     def __init__(self, cooldown_days: int = 2, filepath: str = "logs/trade_cooldowns.json"):
         self.cooldown_days = cooldown_days
         self.filepath = filepath
@@ -221,7 +237,6 @@ class CooldownManager:
         self._save()
 
     def filter_decisions(self, decisions: List[Dict]) -> Tuple[List[Dict], List[str]]:
-        """Filtert Entscheidungen, die sich noch im Cooldown befinden."""
         filtered = []
         warnings = []
         for d in decisions:
@@ -242,12 +257,47 @@ class CooldownManager:
                 self.register_trade(t["ticker"])
 
 
-# Singleton
 cooldown_manager = CooldownManager()
 
 
 # ─────────────────────────────────────────────────────────────
-# STATISTICS (erweiterte Funktionen)
+# KONSISTENZPRÜFUNGEN (ASSERTIONS)
+# ─────────────────────────────────────────────────────────────
+
+def assert_portfolio_consistency(
+    target_weights: Dict[str, float],
+    current_weights: Dict[str, float],
+    cash_target: float,
+    min_trade_value: float,
+    zombie_threshold: float = ZOMBIE_POSITION_THRESHOLD,
+):
+    """Führt mehrere Konsistenzprüfungen durch."""
+    # Keine negativen Gewichte
+    for t, w in target_weights.items():
+        assert w >= 0, f"Negatives Zielgewicht für {t}: {w}"
+    # Summe der Zielgewichte + Cash sollte nicht > 1 sein (kann kleiner sein)
+    total = sum(target_weights.values()) + cash_target
+    assert total <= 1.0 + 1e-6, f"Zielgewichte + Cash überschreiten 100%: {total:.1%}"
+    # Zombie-Threshold darf nicht größer als min_trade_value sein
+    assert zombie_threshold <= min_trade_value, f"Zombie-Threshold ({zombie_threshold}) > min_trade_value ({min_trade_value})"
+    # Keine Position unter min_trade_value als Ziel (außer 0)
+    for t, w in target_weights.items():
+        if w > 0 and w * 100_000 < min_trade_value:
+            log.warning(f"Konsistenz: Zielgewicht {t}={w:.1%} entspricht kleinem Wert (<{min_trade_value})")
+
+
+def assert_no_duplicate_tickers(decisions: List[Dict]):
+    """Prüft, dass kein Ticker in der Entscheidungsliste doppelt vorkommt."""
+    seen = set()
+    for d in decisions:
+        t = d.get("ticker")
+        if t in seen:
+            raise ValueError(f"Duplikater Ticker in Entscheidungen: {t}")
+        seen.add(t)
+
+
+# ─────────────────────────────────────────────────────────────
+# STATISTIKEN
 # ─────────────────────────────────────────────────────────────
 
 def calculate_sharpe_ratio(returns: List[float], risk_free_rate: float = 0.05) -> float:
@@ -328,12 +378,6 @@ def normalize_ai_decisions(
     market_data: Dict[str, Dict],
     correlation_groups: List[List[str]],
 ) -> Tuple[List[Dict], List[str]]:
-    """
-    Normalisiert rohe AI-Entscheidungen vor der finalen Risiko-Validierung.
-    - Entfernt BUYs, die bereits die Zielallokation erreicht haben
-    - Konvertiert SELLs ohne Position zu HOLD
-    - Reduziert redundante korrelierte BUYs
-    """
     warnings = []
     decisions = ensure_decision_ids([dict(d) for d in decisions])
 
@@ -355,32 +399,11 @@ def normalize_ai_decisions(
                 decision["risk_approved"] = False
                 decision["reason"] = f"{decision.get('reason', '')} [NORM: {note}]"
                 warnings.append(note)
-            elif target_alloc - current_alloc < 0.01:
-                note = f"{ticker}: drift {target_alloc-current_alloc:.1%} < 1% → BUY→HOLD"
-                decision["action"] = "HOLD"
-                decision["risk_approved"] = False
-                decision["reason"] = f"{decision.get('reason', '')} [NORM: {note}]"
-                warnings.append(note)
         elif action == "SELL" and current_alloc <= 0:
             note = f"{ticker}: no position → SELL→HOLD"
             decision["action"] = "HOLD"
             decision["risk_approved"] = False
             decision["reason"] = f"{decision.get('reason', '')} [NORM: {note}]"
             warnings.append(note)
-
-    # Korrelations-Filter: Bei stark korrelierten Gruppen nur den besten BUY behalten
-    for group in correlation_groups:
-        group_buys = [d for d in decisions if d.get("action") == "BUY" and d.get("ticker") in group]
-        if len(group_buys) <= 1:
-            continue
-        group_buys.sort(key=lambda d: (d.get("confidence", 0.0), d.get("target_allocation", 0.0)), reverse=True)
-        leader = group_buys[0]
-        for other in group_buys[1:]:
-            if other["confidence"] + 0.05 < leader["confidence"]:
-                note = f"{other['ticker']}: correlated with {leader['ticker']} BUY → downgraded to HOLD"
-                other["action"] = "HOLD"
-                other["risk_approved"] = False
-                other["reason"] = f"{other.get('reason', '')} [NORM: {note}]"
-                warnings.append(note)
 
     return decisions, warnings
