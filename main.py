@@ -1,5 +1,21 @@
 """
-AI Trading Bot - Hauptprogramm (Production, konsolidierte Validierung)
+AI Trading Bot - Hauptprogramm (Production)
+=============================================
+Korrekte Ausführungsreihenfolge mit allen Modulen:
+
+- Regime Detection (Enhanced)
+- Marktdaten & News
+- Portfolio Manager
+- Score Engine (erweitert mit Gesamtscore)
+- CPO Portfolio Rebalancer
+- Deterministic Engine (optional)
+- Decision Weighter (Signal-Fusion)
+- Risk Manager (adaptive Thresholds, CVaR, Circuit Breaker)
+- Capital Rotator (Swap-Logik)
+- Rebalancing-Trade-Berechnung
+- Order Aggregation & Execution
+- Journaling
+- Konsistenzprüfungen (Assertions)
 """
 
 import argparse
@@ -36,7 +52,8 @@ from capital_rotator import CapitalRotator
 from portfolio_rebalancer import PortfolioRebalancer, RebalancingDecision
 from decision_weighter import DecisionWeighter, WeightedSignal
 from order_aggregator import aggregate_trades
-from score_engine import ScoreEngine
+from score_engine import ScoreEngine, rank_assets
+from deterministic_engine import DeterministicPortfolioOptimizer
 
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -66,6 +83,7 @@ class TradingBot:
             cvar_manager=self.risk_manager.cvar_manager if hasattr(self.risk_manager, 'cvar_manager') else None
         )
         self.decision_weighter = DecisionWeighter()
+        self.det_engine = DeterministicPortfolioOptimizer(ACTIVE_RISK_PROFILE)
 
         self._live_logger = LiveRunLogger()
         _guard = self.executor.get_guard()
@@ -151,7 +169,7 @@ class TradingBot:
 
         effective_watchlist = list(set(FULL_WATCHLIST) | set(self.portfolio.positions.keys()))
 
-        # ScoreEngine
+        # ScoreEngine (robust)
         score_engine = ScoreEngine(
             positions=self.portfolio.positions,
             total_value=portfolio_summary_before.get("total_value", 100_000)
@@ -169,7 +187,7 @@ class TradingBot:
         total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
         cash = portfolio_summary_before.get("cash", 0.0)
 
-        # Portfolio Rebalancer
+        # CPO Portfolio Rebalancer
         rebalancing_decisions, target_weights, cash_target, rebalance_rationale = self.rebalancer.optimize_portfolio(
             scores=scores,
             market_data=market_data,
@@ -179,7 +197,22 @@ class TradingBot:
             regime_state=regime_state,
         )
 
-        # KI-Analyse
+        # Deterministic Engine (optional, zusätzliche Validierung)
+        sell_list, buy_list, swap_pairs = self.det_engine.optimize(
+            current_weights=current_weights,
+            target_weights=target_weights,
+            scores=scores,
+            total_value=total_value,
+        )
+        # Log deterministische Ergebnisse (nur Info)
+        for s in sell_list:
+            log.debug(f"DET: SELL {s.ticker} | delta {s.weight_delta:.1%} | {s.reason}")
+        for b in buy_list:
+            log.debug(f"DET: BUY {b.ticker} | delta {b.weight_delta:.1%} | {b.reason}")
+        for sell_t, buy_t, amt in swap_pairs:
+            log.debug(f"DET: SWAP {sell_t} → {buy_t} | amount {amt:.1%}")
+
+        # KI-Analyse mit Rebalancing-Vorschlag
         class MockAllocation:
             def __init__(self, targets, cash_t, rationale):
                 self.target_allocations = targets
@@ -229,7 +262,7 @@ class TradingBot:
                 decision_map[d["ticker"]] = d
         merged_decisions = list(decision_map.values())
 
-        # Normalisierung (nur syntaktisch)
+        # Normalisierung
         normalized_decisions, norm_warnings = normalize_ai_decisions(
             decisions=merged_decisions,
             positions=self.portfolio.positions,
@@ -240,7 +273,7 @@ class TradingBot:
         if norm_warnings:
             run_summary["normalization_warnings"] = norm_warnings
 
-        # Cooldown-Filter (zeitlich)
+        # Cooldown-Filter
         decisions, cooldown_warnings = cooldown_manager.filter_decisions(normalized_decisions)
         if cooldown_warnings:
             run_summary["cooldown_warnings"] = cooldown_warnings
@@ -254,7 +287,7 @@ class TradingBot:
             decisions=decisions,
             portfolio_summary=portfolio_summary_before,
             market_data=market_data,
-            historical_returns=historical_returns,  # CVaR wird intern angewendet
+            historical_returns=historical_returns,
         )
         run_summary["risk_warnings"] = risk_warnings
 
@@ -457,7 +490,7 @@ class TradingBot:
         if executed_records:
             cooldown_manager.register_executed_trades(executed_records)
 
-        # JOURNAL & REPORT
+        # SCHRITT 8: Journal & Snapshot
         log.info("\nSCHRITT 8/8: Journal & Portfolio-Snapshot...")
         self._check_portfolio_consistency(market_data)
         portfolio_summary_after = self._build_portfolio_summary()
@@ -465,7 +498,8 @@ class TradingBot:
 
         real_executed = [r for r in executed_records if r.get("status") == "EXECUTED" or (r.get("fill_qty") or 0) > 0]
 
-        self._print_portfolio_report(current_weights, target_weights, {t: sb.total_score for t, sb in scores_obj.items()})
+        # Portfolio-Report
+        self._print_portfolio_report(current_weights, target_weights, scores)
 
         journal.log_run(
             market_outlook=ai_result.get("market_outlook", ""),
@@ -505,9 +539,8 @@ class TradingBot:
 
         return run_summary
 
-    # Hilfsmethoden (unverändert)
+    # ─── Hilfsmethoden ─────────────────────────────────────────────
     def _final_execution_guard(self, sell_trades, buy_trades, portfolio_summary):
-        # (wie zuvor)
         warnings = []
         _profile = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
         max_position_pct = _profile["max_position_pct"]
