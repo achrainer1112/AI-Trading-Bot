@@ -1,6 +1,6 @@
 """
-AI Trading Bot - Quantitative Score Engine (robust)
-====================================================
+AI Trading Bot - Quantitative Score Engine (robust, ohne Warnungen)
+===================================================================
 """
 
 import math
@@ -90,9 +90,9 @@ class ScoreEngine:
     ) -> Dict[str, ScoreBreakdown]:
         results = {}
         for ticker, data in market_data.items():
-            # Robustheit: data muss ein Dict sein, sonst überspringen
+            # Nur Dictionaries verarbeiten, keine floats oder andere Typen
             if not isinstance(data, dict):
-                log.warning(f"ScoreEngine: Ungültiger Datentyp für {ticker}: {type(data)} – übersprungen")
+                log.debug(f"ScoreEngine: Überspringe {ticker} (kein dict, Typ={type(data)})")
                 continue
             try:
                 sb = self._calculate_score(ticker, data, regime_state, ai_scores, sentiment_scores)
