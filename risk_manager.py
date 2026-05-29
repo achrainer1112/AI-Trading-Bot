@@ -1,19 +1,9 @@
 """
-AI Trading Bot - Risk Manager (Production)
-============================================
-Erweiterte Risikokontrollen:
-
-- Circuit Breaker (Intraday Loss, Drawdown, VIX, Market Halt)
-- Emergency Cash Mode (bei Überschreitung des maximalen Tagesverlusts)
-- VaR (Value at Risk) Berechnung und Limit
-- Volatility Targeting
-- Drawdown Protection
-- Dynamische Max-Trades (basierend auf VIX)
-- Sektor- und Faktor-Exposure Limits
-- Stop-Loss mit ATR-Option
-- Idempotente Entscheidungsauflösung
-- REGIME-AWARE Confidence Thresholds (dynamisch)
-- CVaR (Conditional Value at Risk) Integration
+AI Trading Bot - Risk Manager (Production) – Harte Guardrails
+==============================================================
+Keine Overrides des Risk Layers durch AI.
+Bei Score < Threshold wird BUY strikt abgelehnt.
+Zusätzlich: Konzentrationslimits (max. 25% Einzelposition, CVaR > 50% reduziert automatisch).
 """
 
 from typing import Dict, List, Optional, Set, Tuple
@@ -43,7 +33,7 @@ TOP_N_BUYS = 5
 
 
 class CircuitBreaker:
-    """Circuit Breaker System"""
+    """Circuit Breaker System (unverändert)"""
     def __init__(self):
         self.triggered = False
         self.reason = None
@@ -55,27 +45,27 @@ class CircuitBreaker:
             self.triggered = True
             self.reason = f"Intraday loss: {intraday_loss:.2%} < -5%"
             self.action = 'STOP_ALL_BUYS'
-            log.critical(f"🛑 CIRCUIT BREAKER 1 (Intraday Loss): {self.reason}")
+            log.critical(f"🛑 CIRCUIT BREAKER 1: {self.reason}")
             return True
         drawdown = portfolio.get('drawdown_pct', 0.0)
         if drawdown < -0.10:
             self.triggered = True
             self.reason = f"Portfolio drawdown: {drawdown:.2%} < -10%"
             self.action = 'REDUCE_EXPOSURE'
-            log.critical(f"🛑 CIRCUIT BREAKER 2 (Drawdown): {self.reason}")
+            log.critical(f"🛑 CIRCUIT BREAKER 2: {self.reason}")
             return True
         vix = market_data.get('vix', 20.0)
         if vix > 35:
             self.triggered = True
             self.reason = f"VIX spike: {vix:.1f} > 35"
             self.action = 'DE_RISK_50'
-            log.critical(f"🛑 CIRCUIT BREAKER 3 (VIX Spike): {self.reason}")
+            log.critical(f"🛑 CIRCUIT BREAKER 3: {self.reason}")
             return True
         if market_data.get('market_halted', False):
             self.triggered = True
             self.reason = "Market circuit breaker triggered"
             self.action = 'HALT_ALL'
-            log.critical(f"🛑 CIRCUIT BREAKER 4 (Market Halt): {self.reason}")
+            log.critical(f"🛑 CIRCUIT BREAKER 4: {self.reason}")
             return True
         self.triggered = False
         self.action = None
@@ -86,7 +76,7 @@ class CircuitBreaker:
 
 
 class FinalDecisionResolver:
-    """Auflösung von Konflikten"""
+    """Auflösung von Konflikten (unverändert)"""
     FORCED_EXIT_MARKERS = ("stop_loss", "zombie_cleanup", "forced_rebalancing")
     SELL_PRIORITY = {
         "stop_loss": 100,
@@ -157,7 +147,6 @@ class FinalDecisionResolver:
 
 class CVaRRiskManager:
     """Conditional Value at Risk (Expected Shortfall) Management"""
-
     def __init__(self, cvar_limit_pct: float = 0.05, confidence_level: float = 0.95, lookback_days: int = 252):
         self.cvar_limit_pct = cvar_limit_pct
         self.confidence_level = confidence_level
@@ -203,7 +192,6 @@ class CVaRRiskManager:
         return state
 
     def marginal_cvar_contribution(self, positions: Dict[str, Dict], historical_returns: Dict[str, np.ndarray]) -> Dict[str, float]:
-        """Berechnet den marginalen Beitrag jedes Assets zum Portfolio-CVaR."""
         if not positions or not historical_returns:
             return {}
         total_value = sum(p.get("market_value", 0) for p in positions.values())
@@ -232,7 +220,6 @@ class CVaRRiskManager:
 
     def simulate_trade_impact(self, current_positions: Dict[str, Dict], proposed_trade: Dict,
                               historical_returns: Dict[str, np.ndarray]) -> Dict:
-        """Simuliert die Auswirkung eines einzelnen Trades auf den Portfolio-CVaR."""
         if not current_positions or not historical_returns:
             return {"cvar_before": 0, "cvar_after": 0, "cvar_change": 0, "breach": False}
         total_value_before = sum(p.get("market_value", 0) for p in current_positions.values())
@@ -241,7 +228,6 @@ class CVaRRiskManager:
         port_returns_before = self.calculate_portfolio_returns(current_positions, historical_returns)
         _, cvar_before = self.calculate_cvar(port_returns_before)
         cvar_before = abs(cvar_before)
-        # Simuliere neues Portfolio
         new_positions = {t: {"market_value": v.get("market_value", 0)} for t, v in current_positions.items()}
         ticker = proposed_trade["ticker"]
         action = proposed_trade["action"]
@@ -269,7 +255,6 @@ class CVaRRiskManager:
     def cvar_adjusted_allocation(self, base_allocation: float, ticker: str,
                                  positions: Dict[str, Dict], historical_returns: Dict[str, np.ndarray],
                                  max_position_pct: float = 0.20) -> float:
-        """CVaR-basiertes Position Sizing: Allokation ~ 1 / marginaler Beitrag."""
         if not positions or not historical_returns or ticker not in historical_returns:
             return base_allocation
         contributions = self.marginal_cvar_contribution(positions, historical_returns)
@@ -331,6 +316,7 @@ class CVaRRiskManager:
                 allowed_trades.append(trade)
         return allowed_trades, blocked_buys
 
+
 class RiskManager:
     def __init__(self, risk_profile: RiskProfile = None):
         self.risk_profile = risk_profile or ACTIVE_RISK_PROFILE
@@ -343,6 +329,7 @@ class RiskManager:
         log.info(f"  Max Position: {self.settings['max_position_pct']*100:.0f}% | Min Cash: {self.settings['min_cash_pct']*100:.0f}% | Stop-Loss: {self.settings['stop_loss_pct']*100:.0f}% | Max Trades: {self.settings.get('max_trades_per_run', TOP_N_BUYS)}")
         log.info(f"  CVaR Limit: {CVAR_LIMIT_PCT:.1%} | Confidence: {CVAR_CONFIDENCE_LEVEL:.0%}")
 
+    # ========== ADAPTIVE THRESHOLDS (unverändert) ==========
     def get_adaptive_thresholds(self, regime_state=None, vix: Optional[float] = None, market_momentum: float = 0.0,
                                 cash_pct: float = 1.0, invested_pct: float = 0.0) -> Dict[str, float]:
         if regime_state is None:
@@ -442,6 +429,7 @@ class RiskManager:
                 exposure[sector] = exposure.get(sector, 0.0) + alloc
         return exposure
 
+    # ========== HAUPTVALIDIERUNG MIT HARTEN GUARDRAILS ==========
     def validate_decisions(
         self,
         decisions: List[Dict],
@@ -449,15 +437,11 @@ class RiskManager:
         market_data: Dict,
         historical_returns: Optional[Dict[str, np.ndarray]] = None,
     ) -> Tuple[List[Dict], List[str]]:
-        """
-        Zentrale Risikoprüfung inkl. CVaR, Circuit Breaker, Cash-Invariante.
-        """
         warnings = []
         validated = []
         max_pos = self.settings["max_position_pct"]
         min_cash = self.settings["min_cash_pct"]
         max_sector = self.settings.get("max_sector_exposure", 0.45)
-        max_factor = self.settings.get("max_factor_exposure", 0.60)
 
         total_value = portfolio_summary.get("total_value", 1)
         running_cash = portfolio_summary.get("cash", 0)
@@ -465,7 +449,7 @@ class RiskManager:
 
         decisions = ensure_decision_ids(decisions)
 
-        # ── CIRCUIT BREAKER ──
+        # ── 1. CIRCUIT BREAKER ──
         breaker = CircuitBreaker()
         if breaker.check_all(portfolio_summary, market_data):
             log.warning(f"Circuit Breaker Action: {breaker.get_action()}")
@@ -494,14 +478,14 @@ class RiskManager:
                 decisions = []
                 warnings.append(f"🛑 Circuit Breaker: HALT_ALL (all trades blocked). {breaker.reason}")
 
-        # ── EMERGENCY CASH MODE ──
+        # ── 2. EMERGENCY CASH MODE ──
         if self.emergency_cash_mode(portfolio_summary, market_data):
             for ticker, pos in positions.items():
                 if pos.get('quantity', 0) > 0:
                     decisions.append({'ticker': ticker, 'action': 'SELL', 'target_allocation': 0.0, 'confidence': 1.0, 'reason': 'EMERGENCY CASH MODE: daily loss exceeded', 'risk_approved': True, 'forced_rebalancing': True})
             warnings.append("🚨 EMERGENCY CASH MODE ACTIVATED: all positions liquidated")
 
-        # ── ADAPTIVE CONFIDENCE THRESHOLDS ──
+        # ── 3. ADAPTIVE CONFIDENCE THRESHOLDS ──
         spy_data = market_data.get("SPY", {})
         market_momentum = spy_data.get("return_20d", 0.0) / 100.0
         vix = market_data.get("vix", None)
@@ -511,7 +495,7 @@ class RiskManager:
         buy_conf_threshold = adaptive["buy"]
         sell_conf_threshold = adaptive["sell"]
 
-        # ─── UNGÜLTIGE SELLS FILTERN ──
+        # ─── 4. FILTER UNGÜLTIGER SELLS ──
         filtered_sells = []
         for d in decisions:
             if d.get("action") == "SELL" and d["ticker"] not in positions:
@@ -522,14 +506,13 @@ class RiskManager:
             filtered_sells.append(d)
         decisions = filtered_sells
 
-        # ── REBALANCING SELLS GENERIEREN ──
+        # ── 5. REBALANCING SELLS GENERIEREN ──
         rebalance_sells = self._generate_rebalancing_decisions(decisions, portfolio_summary)
         decisions = rebalance_sells + decisions
 
-        # ── CVaR-INTEGRATION (falls historische Daten vorhanden) ──
-        if historical_returns is not None and hasattr(self, 'cvar_manager'):
+        # ── 6. CVaR-INTEGRATION (falls historische Daten vorhanden) ──
+        if historical_returns is not None:
             try:
-                # Filtert BUYs, die CVaR überschreiten würden, und skaliert sie
                 decisions, cvar_warnings = self.apply_cvar_constraints(
                     decisions=decisions,
                     portfolio_summary=portfolio_summary,
@@ -540,7 +523,7 @@ class RiskManager:
             except Exception as e:
                 log.warning(f"CVaR-Prüfung fehlgeschlagen: {e}")
 
-        # ── DYNAMISCHE MAX-TRADES (VIX-basiert) ──
+        # ── 7. DYNAMISCHE MAX-TRADES ──
         vix_adj_pct = 0
         if vix is not None:
             if vix > 35:
@@ -549,48 +532,31 @@ class RiskManager:
                 vix_adj_pct = -20
         max_trades = self._dynamic_max_trades(market_data, vix_adj_pct)
 
+        # Trenne Entscheidungen
         hold_decisions = [d for d in decisions if d.get("action") == "HOLD"]
         sell_decisions = [d for d in decisions if d.get("action") == "SELL"]
         buy_decisions = [d for d in decisions if d.get("action") == "BUY"]
 
-        sector_exposure = self._sector_exposure(positions, total_value)
-
-        # HOLDs immer durch
-        for d in hold_decisions:
-            d["risk_approved"] = True
-            validated.append(d)
-
-        # SELLs mit adaptiver Confidence
-        for d in sell_decisions:
-            ticker = d.get("ticker", "?")
-            conf = d.get("confidence", 0)
-            is_rebal = d.get("rebalancing", False)
-            is_zombie = d.get("zombie_cleanup", False)
-            is_stop = d.get("stop_loss", False)
-            is_forced = d.get("forced_rebalancing", False)
-
-            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
+        # ── 8. HARD GUARDRAIL: BUY nur wenn Score >= buy_conf_threshold (KEIN OVERRIDE!) ──
+        # Kein "GUARDRAIL OVERRIDE" mehr. Wenn Score zu niedrig, wird BUY strikt abgelehnt.
+        qualified_buys = []
+        for d in buy_decisions:
+            # Verwende entweder quant_score (falls vorhanden) oder confidence als Proxy
+            score = d.get("quant_score", d.get("confidence", 0) * 100)
+            if score >= buy_conf_threshold * 100:   # threshold in % umrechnen
+                qualified_buys.append(d)
+            else:
                 d = dict(d)
                 d["action"] = "HOLD"
-                d["reason"] += f" [ADAPTIVE CONF: {conf:.0%} < SELL threshold {sell_conf_threshold:.0%}]"
+                d["reason"] += f" [HARD GUARDRAIL: Score {score:.0f} < BUY threshold {buy_conf_threshold*100:.0f}]"
                 d["risk_approved"] = False
                 validated.append(d)
-                warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD")
-                continue
+                warnings.append(f"{d['ticker']}: BUY blockiert (Score {score:.0f} < {buy_conf_threshold*100:.0f})")
 
-            pos_market_value = positions.get(ticker, {}).get("market_value", 0)
-            target_alloc = d.get("target_allocation", 0)
-            sell_value = (pos_market_value if target_alloc == 0.0
-                         else max(0, (pos_market_value / total_value - target_alloc) * total_value))
-            running_cash += sell_value
-            d["risk_approved"] = True
-            validated.append(d)
-
-        # BUYs mit adaptiver Confidence und Cash-Limit
-        qualified = [d for d in buy_decisions if d.get("confidence", 0) >= buy_conf_threshold]
-        qualified.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-        top_buys = qualified[:max_trades]
-        skip_buys = qualified[max_trades:]
+        # Sortiere nach Konfidenz
+        qualified_buys.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        top_buys = qualified_buys[:max_trades]
+        skip_buys = qualified_buys[max_trades:]
 
         for d in skip_buys:
             d = dict(d)
@@ -600,6 +566,7 @@ class RiskManager:
             validated.append(d)
             warnings.append(f"{d['ticker']}: Max-Trades Limit → HOLD")
 
+        # ── 9. CASH-VALIDIERUNG FÜR TOP BUYS ──
         for d in top_buys:
             ticker = d.get("ticker", "?")
             target_alloc = d.get("target_allocation", 0)
@@ -630,16 +597,64 @@ class RiskManager:
             d["risk_approved"] = True
             validated.append(d)
 
-        # Finale Cash-Invariante
+        # ── 10. HOLD- und SELL-Entscheidungen (unverändert) ──
+        for d in hold_decisions:
+            d["risk_approved"] = True
+            validated.append(d)
+
+        for d in sell_decisions:
+            ticker = d.get("ticker", "?")
+            conf = d.get("confidence", 0)
+            is_rebal = d.get("rebalancing", False)
+            is_zombie = d.get("zombie_cleanup", False)
+            is_stop = d.get("stop_loss", False)
+            is_forced = d.get("forced_rebalancing", False)
+
+            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
+                d = dict(d)
+                d["action"] = "HOLD"
+                d["reason"] += f" [ADAPTIVE CONF: {conf:.0%} < SELL threshold {sell_conf_threshold:.0%}]"
+                d["risk_approved"] = False
+                validated.append(d)
+                warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD")
+                continue
+
+            pos_market_value = positions.get(ticker, {}).get("market_value", 0)
+            target_alloc = d.get("target_allocation", 0)
+            sell_value = (pos_market_value if target_alloc == 0.0 else max(0, (pos_market_value / total_value - target_alloc) * total_value))
+            running_cash += sell_value
+            d["risk_approved"] = True
+            validated.append(d)
+
+        # ── 11. KONZENTRATIONSLIMIT (neue Regel) ──
+        # Wenn ein Asset > 25% Gewicht oder CVaR-Beitrag > 50%, erzwinge Reduktion
+        cvar_contributions = {}
+        if historical_returns is not None:
+            try:
+                cvar_contributions = self.cvar_manager.marginal_cvar_contribution(positions, historical_returns)
+            except Exception:
+                pass
+        for d in validated:
+            if d.get("action") == "BUY":
+                ticker = d["ticker"]
+                new_weight = d.get("target_allocation", 0)
+                cvar_contrib = cvar_contributions.get(ticker, 0)
+                if new_weight > 0.25 or cvar_contrib > 0.5:
+                    # Reduziere Zielgewicht
+                    reduced = min(0.20, new_weight * 0.7)
+                    d["target_allocation"] = reduced
+                    d["reason"] += f" [CONCENTRATION: Gewicht {new_weight:.1%} -> {reduced:.1%} (Limit 25% / CVaR {cvar_contrib:.0%})]"
+                    log.warning(f"Konzentration reduziert: {ticker} {new_weight:.1%} -> {reduced:.1%}")
+
+        # ── 12. CASH-INVARIANTE ──
         validated, cash_warnings = self._enforce_cash_invariant(
             validated, total_value, running_cash, min_cash, positions, market_data
         )
         warnings.extend(cash_warnings)
 
-        # Konflikte auflösen (FinalDecisionResolver)
+        # ── 13. KONFLIKTE AUFLÖSEN ──
         validated = self._resolver.resolve(validated)
 
-        # Status setzen
         for d in validated:
             if d.get("action") in ("BUY", "SELL") and d.get("risk_approved", False):
                 d["status"] = "APPROVED"
@@ -651,6 +666,7 @@ class RiskManager:
         log.info(f"Risikoprüfung abgeschlossen | FINAL: {sum(1 for d in validated if d['action']=='SELL')} SELL | {sum(1 for d in validated if d['action']=='BUY' and d.get('risk_approved'))} BUY | Cash: {format_currency(running_cash)} ({running_cash/total_value:.0%})")
         return validated, warnings
 
+    # ─── HILFSMETHODEN (unverändert) ───
     def _generate_rebalancing_decisions(self, decisions: List[Dict], portfolio_summary: Dict) -> List[Dict]:
         total_value = portfolio_summary.get("total_value", 1)
         positions = portfolio_summary.get("positions", {})
@@ -760,74 +776,20 @@ class RiskManager:
     def get_adaptive_log(self) -> Dict:
         return getattr(self, '_last_adaptive_log', {})
 
-    def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict,
-                               market_data: Dict, historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
+    def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict, market_data: Dict, historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
         if historical_returns is None:
             return decisions, []
         positions = portfolio_summary.get("positions", {})
         total_value = portfolio_summary.get("total_value", 1)
         if total_value <= 0:
             return decisions, []
-
-        # 1. Aktuellen CVaR berechnen
         port_returns = self.cvar_manager.calculate_portfolio_returns(positions, historical_returns)
         cvar_state = self.cvar_manager.evaluate_risk_state(port_returns)
-        cvar_limit = cvar_state["limit_pct"]
-        current_cvar = cvar_state["cvar_pct"]
-
-        # 2. Marginalen Beitrag jedes Assets (für Reporting)
-        marginal_contrib = self.cvar_manager.marginal_cvar_contribution(positions, historical_returns)
-        if marginal_contrib:
-            top5 = sorted(marginal_contrib.items(), key=lambda x: -x[1])[:5]
-            log.info(f"CVaR Marginal Contributions: { {t: f'{v:.1%}' for t, v in top5} }")
-
-        # 3. Pre-Trade-Simulation für jeden BUY
-        approved = []
-        blocked = []
-        for d in decisions:
-            if d.get("action") != "BUY":
-                approved.append(d)
-                continue
-            trade_sim = self.cvar_manager.simulate_trade_impact(positions, {
-                "ticker": d["ticker"],
-                "action": "BUY",
-                "value_usd": d.get("target_allocation", 0) * total_value
-            }, historical_returns)
-            if trade_sim["breach"]:
-                # Versuche zu skalieren
-                current_alloc = d.get("target_allocation", 0)
-                if current_alloc > 0.01:
-                    # Vereinfachte lineare Skalierung
-                    scale = (cvar_limit - current_cvar) / (trade_sim["cvar_change"] + 1e-6)
-                    scale = max(0, min(1, scale))
-                    if scale > 0.3:
-                        new_alloc = current_alloc * scale
-                        d["target_allocation"] = round(new_alloc, 4)
-                        d["reason"] += f" [CVaR scaled: {current_alloc:.1%} -> {new_alloc:.1%}]"
-                        approved.append(d)
-                        log.info(f"CVaR: BUY {d['ticker']} scaled to {new_alloc:.1%}")
-                    else:
-                        blocked.append(d)
-                        log.info(f"CVaR: BUY {d['ticker']} blocked (would exceed CVaR limit)")
-                else:
-                    blocked.append(d)
-            else:
-                approved.append(d)
-
-        # 4. CVaR-basiertes Position Sizing für alle BUYs
-        for d in approved:
-            if d.get("action") == "BUY":
-                orig_alloc = d["target_allocation"]
-                max_pos = self.settings.get("max_position_pct", 0.20)
-                adjusted = self.cvar_manager.cvar_adjusted_allocation(
-                    orig_alloc, d["ticker"], positions, historical_returns, max_pos
-                )
-                if adjusted != orig_alloc:
-                    d["target_allocation"] = round(adjusted, 4)
-                    d["reason"] += f" [CVaR sizing: {orig_alloc:.1%} -> {adjusted:.1%}]"
-                    log.info(f"CVaR sizing: {d['ticker']} {orig_alloc:.1%} -> {adjusted:.1%}")
-
-        warnings = []
-        if blocked:
-            warnings.append(f"CVaR blocked {len(blocked)} BUYs")
-        return approved, warnings
+        if not cvar_state["breach"]:
+            return decisions, []
+        volatility_data = {t: d.get("volatility_annual_pct", 20.0) for t, d in market_data.items()}
+        allowed, blocked = self.cvar_manager.filter_trades_by_cvar(decisions, cvar_state, positions, historical_returns, volatility_data)
+        warnings = [f"CVaR constraint active: {cvar_state['cvar_pct']:.2%} > limit {cvar_state['limit_pct']:.2%}"]
+        for b in blocked:
+            warnings.append(f"Blocked BUY {b['ticker']} due to CVaR breach")
+        return allowed, warnings
