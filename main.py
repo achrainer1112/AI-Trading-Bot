@@ -52,7 +52,7 @@ from capital_rotator import CapitalRotator
 from portfolio_rebalancer import PortfolioRebalancer, RebalancingDecision
 from decision_weighter import DecisionWeighter, WeightedSignal
 from order_aggregator import aggregate_trades
-from score_engine import ScoreEngine, rank_assets
+from score_engine import ScoreEngine, rank_candidates as rank_assets
 from deterministic_engine import DeterministicPortfolioOptimizer
 
 import os
