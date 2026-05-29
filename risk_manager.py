@@ -389,17 +389,30 @@ class RiskManager:
                 exposure[sector] = exposure.get(sector, 0.0) + alloc
         return exposure
 
-    def validate_decisions(self, decisions: List[Dict], portfolio_summary: Dict, market_data: Dict) -> Tuple[List[Dict], List[str]]:
+    def validate_decisions(
+        self,
+        decisions: List[Dict],
+        portfolio_summary: Dict,
+        market_data: Dict,
+        historical_returns: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Tuple[List[Dict], List[str]]:
+        """
+        Zentrale Risikoprüfung inkl. CVaR, Circuit Breaker, Cash-Invariante.
+        """
         warnings = []
         validated = []
         max_pos = self.settings["max_position_pct"]
         min_cash = self.settings["min_cash_pct"]
         max_sector = self.settings.get("max_sector_exposure", 0.45)
         max_factor = self.settings.get("max_factor_exposure", 0.60)
+
         total_value = portfolio_summary.get("total_value", 1)
         running_cash = portfolio_summary.get("cash", 0)
         positions = portfolio_summary.get("positions", {})
+
         decisions = ensure_decision_ids(decisions)
+
+        # ── CIRCUIT BREAKER ──
         breaker = CircuitBreaker()
         if breaker.check_all(portfolio_summary, market_data):
             log.warning(f"Circuit Breaker Action: {breaker.get_action()}")
@@ -427,19 +440,25 @@ class RiskManager:
             elif breaker.action == 'HALT_ALL':
                 decisions = []
                 warnings.append(f"🛑 Circuit Breaker: HALT_ALL (all trades blocked). {breaker.reason}")
+
+        # ── EMERGENCY CASH MODE ──
         if self.emergency_cash_mode(portfolio_summary, market_data):
             for ticker, pos in positions.items():
                 if pos.get('quantity', 0) > 0:
                     decisions.append({'ticker': ticker, 'action': 'SELL', 'target_allocation': 0.0, 'confidence': 1.0, 'reason': 'EMERGENCY CASH MODE: daily loss exceeded', 'risk_approved': True, 'forced_rebalancing': True})
             warnings.append("🚨 EMERGENCY CASH MODE ACTIVATED: all positions liquidated")
+
+        # ── ADAPTIVE CONFIDENCE THRESHOLDS ──
         spy_data = market_data.get("SPY", {})
         market_momentum = spy_data.get("return_20d", 0.0) / 100.0
         vix = market_data.get("vix", None)
         cash_pct = portfolio_summary.get("cash_pct", 100.0) / 100.0
         invested_pct = 1.0 - cash_pct
-        adaptive = self.get_adaptive_thresholds(regime_state=self.regime_state, vix=vix, market_momentum=market_momentum, cash_pct=cash_pct, invested_pct=invested_pct)
+        adaptive = self.get_adaptive_thresholds(self.regime_state, vix, market_momentum, cash_pct, invested_pct)
         buy_conf_threshold = adaptive["buy"]
         sell_conf_threshold = adaptive["sell"]
+
+        # ─── UNGÜLTIGE SELLS FILTERN ──
         filtered_sells = []
         for d in decisions:
             if d.get("action") == "SELL" and d["ticker"] not in positions:
@@ -449,8 +468,26 @@ class RiskManager:
                 continue
             filtered_sells.append(d)
         decisions = filtered_sells
+
+        # ── REBALANCING SELLS GENERIEREN ──
         rebalance_sells = self._generate_rebalancing_decisions(decisions, portfolio_summary)
         decisions = rebalance_sells + decisions
+
+        # ── CVaR-INTEGRATION (falls historische Daten vorhanden) ──
+        if historical_returns is not None and hasattr(self, 'cvar_manager'):
+            try:
+                # Filtert BUYs, die CVaR überschreiten würden, und skaliert sie
+                decisions, cvar_warnings = self.apply_cvar_constraints(
+                    decisions=decisions,
+                    portfolio_summary=portfolio_summary,
+                    market_data=market_data,
+                    historical_returns=historical_returns,
+                )
+                warnings.extend(cvar_warnings)
+            except Exception as e:
+                log.warning(f"CVaR-Prüfung fehlgeschlagen: {e}")
+
+        # ── DYNAMISCHE MAX-TRADES (VIX-basiert) ──
         vix_adj_pct = 0
         if vix is not None:
             if vix > 35:
@@ -458,13 +495,19 @@ class RiskManager:
             elif vix > 25:
                 vix_adj_pct = -20
         max_trades = self._dynamic_max_trades(market_data, vix_adj_pct)
+
         hold_decisions = [d for d in decisions if d.get("action") == "HOLD"]
         sell_decisions = [d for d in decisions if d.get("action") == "SELL"]
         buy_decisions = [d for d in decisions if d.get("action") == "BUY"]
+
         sector_exposure = self._sector_exposure(positions, total_value)
+
+        # HOLDs immer durch
         for d in hold_decisions:
             d["risk_approved"] = True
             validated.append(d)
+
+        # SELLs mit adaptiver Confidence
         for d in sell_decisions:
             ticker = d.get("ticker", "?")
             conf = d.get("confidence", 0)
@@ -472,6 +515,7 @@ class RiskManager:
             is_zombie = d.get("zombie_cleanup", False)
             is_stop = d.get("stop_loss", False)
             is_forced = d.get("forced_rebalancing", False)
+
             if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
                 d = dict(d)
                 d["action"] = "HOLD"
@@ -480,16 +524,21 @@ class RiskManager:
                 validated.append(d)
                 warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD")
                 continue
+
             pos_market_value = positions.get(ticker, {}).get("market_value", 0)
             target_alloc = d.get("target_allocation", 0)
-            sell_value = (pos_market_value if target_alloc == 0.0 else max(0, (pos_market_value / total_value - target_alloc) * total_value))
+            sell_value = (pos_market_value if target_alloc == 0.0
+                         else max(0, (pos_market_value / total_value - target_alloc) * total_value))
             running_cash += sell_value
             d["risk_approved"] = True
             validated.append(d)
+
+        # BUYs mit adaptiver Confidence und Cash-Limit
         qualified = [d for d in buy_decisions if d.get("confidence", 0) >= buy_conf_threshold]
         qualified.sort(key=lambda x: x.get("confidence", 0), reverse=True)
         top_buys = qualified[:max_trades]
         skip_buys = qualified[max_trades:]
+
         for d in skip_buys:
             d = dict(d)
             d["action"] = "HOLD"
@@ -497,6 +546,7 @@ class RiskManager:
             d["risk_approved"] = False
             validated.append(d)
             warnings.append(f"{d['ticker']}: Max-Trades Limit → HOLD")
+
         for d in top_buys:
             ticker = d.get("ticker", "?")
             target_alloc = d.get("target_allocation", 0)
@@ -504,6 +554,7 @@ class RiskManager:
             buy_cost = max(0, total_value * target_alloc - current_value)
             cash_after = running_cash - buy_cost
             cash_pct_after = cash_after / total_value if total_value > 0 else 0
+
             if cash_pct_after < min_cash:
                 max_spend = running_cash - (total_value * min_cash)
                 if max_spend >= 500:
@@ -521,12 +572,21 @@ class RiskManager:
                     validated.append(d)
                     warnings.append(f"{ticker}: Cash reicht nicht → HOLD")
                 continue
+
             running_cash -= buy_cost
             d["risk_approved"] = True
             validated.append(d)
-        validated, cash_warnings = self._enforce_cash_invariant(validated, total_value, running_cash, min_cash, positions, market_data)
+
+        # Finale Cash-Invariante
+        validated, cash_warnings = self._enforce_cash_invariant(
+            validated, total_value, running_cash, min_cash, positions, market_data
+        )
         warnings.extend(cash_warnings)
+
+        # Konflikte auflösen (FinalDecisionResolver)
         validated = self._resolver.resolve(validated)
+
+        # Status setzen
         for d in validated:
             if d.get("action") in ("BUY", "SELL") and d.get("risk_approved", False):
                 d["status"] = "APPROVED"
@@ -534,6 +594,7 @@ class RiskManager:
                 d["status"] = "BLOCKED"
             else:
                 d["status"] = "HOLD"
+
         log.info(f"Risikoprüfung abgeschlossen | FINAL: {sum(1 for d in validated if d['action']=='SELL')} SELL | {sum(1 for d in validated if d['action']=='BUY' and d.get('risk_approved'))} BUY | Cash: {format_currency(running_cash)} ({running_cash/total_value:.0%})")
         return validated, warnings
 
