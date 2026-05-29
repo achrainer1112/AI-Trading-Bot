@@ -1,7 +1,7 @@
 """
-AI Trading Bot - Marktdaten-Collector (robust)
-================================================
-Sammelt Marktdaten und stellt sicher, dass jeder Eintrag ein Dict ist.
+AI Trading Bot - Marktdaten-Collector (ULTIMATIV ROBUST)
+=========================================================
+Garantiert, dass jeder Eintrag in market_data ein Dict ist.
 """
 
 from datetime import datetime, timedelta
@@ -48,21 +48,69 @@ class MarketDataCollector:
             return None
 
     def calculate_metrics(self, ticker: str, spy_close: Optional[pd.Series] = None) -> Dict:
-        """Berechnet Metriken; gibt immer ein Dict zurück, niemals None oder float."""
+        """
+        Berechnet Metriken; gibt IMMER ein Dict zurück. Bei Fehlern wird ein leeres Dict mit Minimalwerten geliefert.
+        """
+        default = {
+            "ticker": ticker,
+            "current_price": 0.0,
+            "return_7d": None,
+            "return_20d": None,
+            "return_30d": None,
+            "return_60d": None,
+            "return_90d": None,
+            "volatility_annual_pct": 20.0,
+            "sma_7": None,
+            "sma_20": None,
+            "sma_50": None,
+            "sma_90": None,
+            "sma_200": None,
+            "above_sma_20": None,
+            "above_sma_30": None,
+            "above_sma_50": None,
+            "above_sma_90": None,
+            "sma_distance_pct": None,
+            "rsi_14": None,
+            "relative_strength_vs_spy": None,
+            "avg_volume_20d": None,
+            "macd_line": None,
+            "macd_signal": None,
+            "macd_histogram": None,
+            "bb_upper": None,
+            "bb_middle": None,
+            "bb_lower": None,
+            "bb_position": None,
+            "atr_14": None,
+            "ema_12": None,
+            "ema_26": None,
+            "open_gap_pct": None,
+            "high_52w": None,
+            "low_52w": None,
+            "data_points": 0,
+            "last_updated": datetime.now().isoformat(),
+        }
+
         df = self.data_cache.get(ticker)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             df = self.fetch_price_history(ticker)
         if df is None or len(df) < 10:
-            return self._empty_metrics(ticker)
+            return default
 
-        close = df["Close"]
-        high = df["High"] if "High" in df else close
-        low = df["Low"] if "Low" in df else close
-        current_price = float(close.iloc[-1])
+        try:
+            close = df["Close"]
+            high = df["High"] if "High" in df else close
+            low = df["Low"] if "Low" in df else close
+            current_price = float(close.iloc[-1])
+        except Exception as e:
+            log.warning(f"Fehler beim Extrahieren von Close/High/Low für {ticker}: {e}")
+            return default
 
         def safe_return(days: int) -> Optional[float]:
             if len(close) > days:
-                return float((close.iloc[-1] / close.iloc[-days - 1] - 1) * 100)
+                try:
+                    return float((close.iloc[-1] / close.iloc[-days - 1] - 1) * 100)
+                except Exception:
+                    return None
             return None
 
         return_7d = safe_return(SHORT_WINDOW)
@@ -166,7 +214,6 @@ class MarketDataCollector:
             high_52w = float(close.tail(252).max())
             low_52w = float(close.tail(252).min())
 
-        # Immer ein Dictionary zurückgeben, auch wenn Werte fehlen
         return {
             "ticker": ticker,
             "current_price": current_price,
@@ -206,56 +253,18 @@ class MarketDataCollector:
             "last_updated": datetime.now().isoformat(),
         }
 
-    def _empty_metrics(self, ticker: str) -> Dict:
-        """Fallback für fehlende Daten – immer ein Dict, kein float."""
-        return {
-            "ticker": ticker,
-            "current_price": 0.0,
-            "return_7d": None,
-            "return_20d": None,
-            "return_30d": None,
-            "return_60d": None,
-            "return_90d": None,
-            "volatility_annual_pct": 20.0,
-            "sma_7": None,
-            "sma_20": None,
-            "sma_50": None,
-            "sma_90": None,
-            "sma_200": None,
-            "above_sma_20": None,
-            "above_sma_30": None,
-            "above_sma_50": None,
-            "above_sma_90": None,
-            "sma_distance_pct": None,
-            "rsi_14": None,
-            "relative_strength_vs_spy": None,
-            "avg_volume_20d": None,
-            "macd_line": None,
-            "macd_signal": None,
-            "macd_histogram": None,
-            "bb_upper": None,
-            "bb_middle": None,
-            "bb_lower": None,
-            "bb_position": None,
-            "atr_14": None,
-            "ema_12": None,
-            "ema_26": None,
-            "open_gap_pct": None,
-            "high_52w": None,
-            "low_52w": None,
-            "data_points": 0,
-            "last_updated": datetime.now().isoformat(),
-        }
-
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> Optional[float]:
         if len(prices) < period + 1:
             return None
-        delta = prices.diff()
-        gain = delta.clip(lower=0).rolling(period).mean()
-        loss = (-delta.clip(upper=0)).rolling(period).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        return float(rsi.iloc[-1])
+        try:
+            delta = prices.diff()
+            gain = delta.clip(lower=0).rolling(period).mean()
+            loss = (-delta.clip(upper=0)).rolling(period).mean()
+            rs = gain / loss.replace(0, np.nan)
+            rsi = 100 - (100 / (1 + rs))
+            return float(rsi.iloc[-1])
+        except Exception:
+            return None
 
     def collect_all(self) -> Dict[str, Dict]:
         log.info(f"Sammle Marktdaten für {len(self.watchlist)} Assets...")
@@ -269,10 +278,10 @@ class MarketDataCollector:
         for ticker in self.watchlist:
             log.debug(f"  → Lade {ticker}")
             metrics = self.calculate_metrics(ticker, spy_close=spy_close if ticker != "SPY" else None)
-            # Sicherheitshalber: wenn metrics kein Dict ist, in Dummy umwandeln
+            # Sicherheitshalber: falls metrics aus irgendeinem Grund kein Dict ist (sollte nie passieren)
             if not isinstance(metrics, dict):
                 log.warning(f"  ✗ Ungültiges Format für {ticker}: {type(metrics)} – ersetze durch leeres Dict")
-                metrics = self._empty_metrics(ticker)
+                metrics = {"ticker": ticker, "current_price": 0.0}
             results[ticker] = metrics
             if metrics.get("current_price", 0) > 0:
                 log.debug(f"  ✓ {ticker}: ${metrics.get('current_price', 0):.2f}")
