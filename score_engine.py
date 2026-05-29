@@ -1,6 +1,8 @@
 """
-AI Trading Bot - Quantitative Score Engine (ultimativ robust)
-==============================================================
+AI Trading Bot - Quantitative Score Engine (Type Safe)
+=======================================================
+Sichere Extraktion von Daten – nur Dictionaries werden verarbeitet,
+alle anderen Typen werden durch Dummy-Scores ersetzt (ohne Warnungen im Normalbetrieb).
 """
 
 import math
@@ -80,13 +82,18 @@ class ScoreEngine:
         self.total_value = total_value
 
     def score_all(self, market_data: Dict, regime_state=None, ai_scores=None, sentiment_scores=None) -> Dict[str, ScoreBreakdown]:
+        """
+        Gibt für jeden Ticker einen ScoreBreakdown zurück.
+        Bei ungültigen Daten (kein dict) wird ein Dummy-Score (50) zurückgegeben.
+        Keine lauten Warnungen im Normalbetrieb – nur Debug-Logs.
+        """
         results = {}
         ai_scores = ai_scores or {}
         sentiment_scores = sentiment_scores or {}
         for ticker, data in market_data.items():
-            # CRITICAL: Prüfe, ob data ein dict ist
+            # TYPE SAFETY: Nur Dictionaries verarbeiten
             if not isinstance(data, dict):
-                log.warning(f"ScoreEngine: Überspringe {ticker}, data ist {type(data)} (kein Dict) – verwende Dummy")
+                log.debug(f"ScoreEngine: Überspringe {ticker}, data ist {type(data)} (kein Dict) – verwende Dummy")
                 dummy = ScoreBreakdown(ticker=ticker, total_score=50.0, signal="HOLD", recommended_action="HOLD")
                 results[ticker] = dummy
                 continue
@@ -99,7 +106,15 @@ class ScoreEngine:
                 results[ticker] = dummy
         return results
 
-    def _calculate_score(self, ticker: str, data: Dict, regime_state, ai_scores, sentiment_scores) -> ScoreBreakdown:
+    def _calculate_score(
+        self,
+        ticker: str,
+        data: Dict,
+        regime_state=None,
+        ai_scores: Dict[str, float] = None,
+        sentiment_scores: Dict[str, float] = None,
+    ) -> ScoreBreakdown:
+        # Sichere Extraktion mit Defaults
         current_price = data.get("current_price", 0.0) or 0.0
         rsi = data.get("rsi_14")
         return_20d = data.get("return_20d") or data.get("return_30d") or 0.0
