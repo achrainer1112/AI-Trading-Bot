@@ -1,6 +1,22 @@
 """
-AI Trading Bot - Konfigurationsdatei (erweitert)
-=================================================
+AI Trading Bot - Konfigurationsdatei (final)
+=============================================
+Enthält alle Parameter für:
+- Trading Modus
+- API Keys
+- Risikoprofile
+- Regime-abhängige Confidence Thresholds
+- Volatilitäts-Multiplier
+- Momentum-Boosting
+- Korrelations-Cluster
+- CVaR Risikomanagement
+- Zombie-Logik
+- Capital Rotation (Swap)
+- Rebalancing Engine
+- Dynamic Position Sizing
+- News & Sentiment
+- Backtesting
+- Dashboard
 """
 
 import os
@@ -26,7 +42,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# RISIKOPROFILE
+# RISIKOPROFILE (BALANCED als Standard)
 # ─────────────────────────────────────────────
 class RiskProfile(Enum):
     CONSERVATIVE = "conservative"
@@ -102,30 +118,17 @@ RISK_SETTINGS = {
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 
 # ─────────────────────────────────────────────
-# SCORE ENGINE (fehlende Konstanten)
-# ─────────────────────────────────────────────
-DEFAULT_MIN_BUY_SCORE = 60
-SCORE_TOP_K_CANDIDATES = 8
-LLM_SCORE_OVERRIDE_LIMIT = 15
-
-# ─────────────────────────────────────────────
-# REGIME-AWARE RISK ENGINE
+# REGIME-AWARE CONFIDENCE THRESHOLDS
 # ─────────────────────────────────────────────
 REGIME_CONFIDENCE_THRESHOLDS = {
-    "BULL": {
-        "buy_threshold": 0.55,
-        "sell_threshold": 0.70,
-    },
-    "SIDEWAYS": {
-        "buy_threshold": 0.65,
-        "sell_threshold": 0.65,
-    },
-    "BEAR": {
-        "buy_threshold": 0.75,
-        "sell_threshold": 0.55,
-    },
+    "BULL": {"buy_threshold": 0.55, "sell_threshold": 0.70},
+    "SIDEWAYS": {"buy_threshold": 0.65, "sell_threshold": 0.65},
+    "BEAR": {"buy_threshold": 0.75, "sell_threshold": 0.55},
 }
 
+# ─────────────────────────────────────────────
+# VOLATILITÄTS-MULTIPLIER (für Position Sizing)
+# ─────────────────────────────────────────────
 VOLATILITY_MULTIPLIERS = {
     "very_low": {"max_vol": 15.0, "multiplier": 1.2},
     "low":      {"max_vol": 25.0, "multiplier": 1.0},
@@ -135,8 +138,11 @@ VOLATILITY_MULTIPLIERS = {
 
 MOMENTUM_BOOST_ENABLED = True
 MOMENTUM_BOOST_FACTOR = 1.2
-MOMENTUM_STRENGTH_THRESHOLD = 10.0
+MOMENTUM_STRENGTH_THRESHOLD = 10.0   # in Prozent
 
+# ─────────────────────────────────────────────
+# KORRELATIONS-CLUSTER (für Exposure Control)
+# ─────────────────────────────────────────────
 CORRELATION_CLUSTERS = [
     {"name": "mega_tech", "tickers": ["AAPL", "MSFT", "NVDA", "AMD", "QQQ", "XLK"]},
     {"name": "financial", "tickers": ["JPM", "V", "MA", "XLF"]},
@@ -151,11 +157,59 @@ MAX_CLUSTER_EXPOSURE = {
     "defensive": 0.50,
 }
 
+# ─────────────────────────────────────────────
+# CASH-MANAGEMENT (Regime-abhängig)
+# ─────────────────────────────────────────────
 CASH_TARGET_BY_REGIME = {
     "BULL": 0.07,
     "SIDEWAYS": 0.15,
     "BEAR": 0.30,
 }
+
+# ─────────────────────────────────────────────
+# CVAR RISK MANAGEMENT
+# ─────────────────────────────────────────────
+CVAR_LIMIT_PCT = 0.05          # 5% maximaler Expected Shortfall
+CVAR_CONFIDENCE_LEVEL = 0.95   # 95% Konfidenz
+CVAR_LOOKBACK_DAYS = 252       # 1 Jahr historische Daten
+
+# ─────────────────────────────────────────────
+# ZOMBIE-LOGIK (Mindestalter)
+# ─────────────────────────────────────────────
+ZOMBIE_POSITION_THRESHOLD = 50.0   # USD
+ZOMBIE_MIN_AGE_DAYS = 7            # Mindestalter in Tagen
+ZOMBIE_MIN_RUNS = 5                # Alternative: Mindestanzahl Runs
+
+# ─────────────────────────────────────────────
+# CAPITAL ROTATION (SWAP-LOGIK)
+# ─────────────────────────────────────────────
+CAPITAL_ROTATION_ENABLED = True
+SWAP_MIN_SCORE_DIFF = 15.0         # Mindest-Score-Differenz für Swap
+SWAP_MAX_PER_RUN = 2
+SWAP_MIN_VALUE_USD = 100.0
+SWAP_MIN_HOLD_DAYS = 5
+
+# ─────────────────────────────────────────────
+# REBALANCING ENGINE (CPO)
+# ─────────────────────────────────────────────
+REBALANCING_ENGINE_ENABLED = True
+REBALANCING_MAX_TRADES = 5
+REBALANCING_MIN_DRIFT = 0.02       # 2% Mindestabweichung
+
+# ─────────────────────────────────────────────
+# DYNAMIC POSITION SIZING
+# ─────────────────────────────────────────────
+DYNAMIC_POSITION_SIZING_ENABLED = True
+VOLATILITY_TARGET = 0.15
+MAX_VOLATILITY_FACTOR = 2.0
+MIN_VOLATILITY_FACTOR = 0.5
+
+# ─────────────────────────────────────────────
+# SCORE ENGINE
+# ─────────────────────────────────────────────
+DEFAULT_MIN_BUY_SCORE = 60
+SCORE_TOP_K_CANDIDATES = 8
+LLM_SCORE_OVERRIDE_LIMIT = 15
 
 # ─────────────────────────────────────────────
 # WATCHLIST & ETFs
@@ -196,7 +250,7 @@ ETF_SECTOR_WEIGHTS = {
 ETF_FACTOR_WEIGHTS = ETF_SECTOR_WEIGHTS
 
 # ─────────────────────────────────────────────
-# PORTFOLIO EINSTELLUNGEN
+# PORTFOLIO & TRADE EINSTELLUNGEN
 # ─────────────────────────────────────────────
 PORTFOLIO_FILE = "portfolio.json"
 TRADE_LOG_FILE = "logs/trades.json"
@@ -204,29 +258,17 @@ PORTFOLIO_HISTORY_FILE = "logs/portfolio_history.json"
 LOG_DIR = "logs"
 
 INITIAL_CAPITAL = 100_000.0
-MIN_ORDER_VALUE = 10.0
-
-# ─────────────────────────────────────────────
-# REBALANCING
-# ─────────────────────────────────────────────
-REBALANCING_ENGINE_ENABLED = True
-REBALANCING_MAX_TRADES = 5
-REBALANCING_MIN_DRIFT = 0.02
+MIN_ORDER_VALUE = 10.0           # reduziert für kleine Konten
 TRADE_FRICTION_PCT = 0.001
+TAX_ESTIMATE_PCT = 0.0
+DEFAULT_ASSET_COOLDOWN_DAYS = 2
+COOLDOWN_FILE = "logs/trade_cooldowns.json"
 
 # ─────────────────────────────────────────────
-# BACKTESTING
+# PERFORMANCE TRACKING
 # ─────────────────────────────────────────────
-BACKTEST_START_DATE = "2022-01-01"
-BACKTEST_END_DATE = "2024-01-01"
-BACKTEST_INITIAL_CAPITAL = 100_000.0
-BACKTEST_COMMISSION = 0.001
-
-# ─────────────────────────────────────────────
-# DASHBOARD
-# ─────────────────────────────────────────────
-DASHBOARD_PORT = 8501
-ENABLE_DASHBOARD = True
+PERFORMANCE_FILE = "logs/performance_stats.json"
+SIGNAL_STATS_FILE = "logs/signal_stats.json"
 
 # ─────────────────────────────────────────────
 # SCHEDULER
@@ -252,8 +294,16 @@ NEWS_TOPICS = [
     "energy prices", "federal reserve", "earnings", "GDP"
 ]
 
+# ─────────────────────────────────────────────
+# BACKTESTING
+# ─────────────────────────────────────────────
+BACKTEST_START_DATE = "2022-01-01"
+BACKTEST_END_DATE = "2024-01-01"
+BACKTEST_INITIAL_CAPITAL = 100_000.0
+BACKTEST_COMMISSION = 0.001
 
-# ===== CVaR (Conditional Value at Risk) Risk Management =====
-CVAR_LIMIT_PCT = 0.05          # 5% maximaler Expected Shortfall (Tail Risk)
-CVAR_CONFIDENCE_LEVEL = 0.95   # 95% Konfidenzniveau für VaR/CVaR
-CVAR_LOOKBACK_DAYS = 252       # 252 Tage historische Daten (1 Handelsjahr)
+# ─────────────────────────────────────────────
+# DASHBOARD
+# ─────────────────────────────────────────────
+DASHBOARD_PORT = 8501
+ENABLE_DASHBOARD = True
