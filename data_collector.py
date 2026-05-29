@@ -1,17 +1,7 @@
 """
-AI Trading Bot - Marktdaten-Collector (Enhanced)
-==================================================
-Sammelt erweiterte Metriken für alle Watchlist-Assets:
-  - SMA20, SMA50, SMA90, SMA200
-  - Momentum 20d/30d/60d
-  - Relative Strength vs SPY
-  - RSI
-  - MACD
-  - Bollinger Bands
-  - ATR (Average True Range)
-  - EMA12, EMA26 (für Crossover)
-  - Open Gap
-  - 52w High/Low
+AI Trading Bot - Marktdaten-Collector (robust)
+================================================
+Sammelt Marktdaten und stellt sicher, dass jeder Eintrag ein Dict ist.
 """
 
 from datetime import datetime, timedelta
@@ -33,35 +23,24 @@ except ImportError:
 
 
 class MarketDataCollector:
-    """
-    Sammelt und berechnet Marktdaten für alle Assets.
-    Liefert deterministische, vollständige Metriken für Score Engine und LLM.
-    """
-
     def __init__(self, watchlist: List[str] = None):
         self.watchlist = watchlist or FULL_WATCHLIST
         self.data_cache: Dict[str, pd.DataFrame] = {}
 
     def fetch_price_history(self, ticker: str, days: int = PRICE_HISTORY_DAYS) -> Optional[pd.DataFrame]:
-        """Lädt historische OHLCV-Daten für einen Ticker."""
         try:
             end = datetime.today()
-            start = end - timedelta(days=days + 120)   # extra Puffer für Indikatoren
+            start = end - timedelta(days=days + 120)
             df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-            if df is None or getattr(df, "empty", True):
+            if df is None or df.empty:
                 log.warning(f"Keine Daten für {ticker}")
                 return None
-
-            # Normalisiere Spaltennamen
             df = self._normalize_ohlcv_columns(df)
-
-            # Stelle sicher, dass Index datetime ist und sortiert
             try:
                 df.index = pd.to_datetime(df.index)
                 df = df.sort_index()
             except Exception:
                 pass
-
             self.data_cache[ticker] = df
             return df
         except Exception as e:
@@ -69,15 +48,12 @@ class MarketDataCollector:
             return None
 
     def calculate_metrics(self, ticker: str, spy_close: Optional[pd.Series] = None) -> Dict:
-        """
-        Berechnet alle relevanten Metriken für einen Ticker.
-        Neu: ATR, SMA200, EMA12, EMA26.
-        """
+        """Berechnet Metriken; gibt immer ein Dict zurück, niemals None oder float."""
         df = self.data_cache.get(ticker)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             df = self.fetch_price_history(ticker)
         if df is None or len(df) < 10:
-            return {}
+            return self._empty_metrics(ticker)
 
         close = df["Close"]
         high = df["High"] if "High" in df else close
@@ -89,18 +65,16 @@ class MarketDataCollector:
                 return float((close.iloc[-1] / close.iloc[-days - 1] - 1) * 100)
             return None
 
-        # Returns
-        return_7d  = safe_return(SHORT_WINDOW)
+        return_7d = safe_return(SHORT_WINDOW)
         return_20d = safe_return(MEDIUM_WINDOW)
         return_30d = safe_return(30)
         return_60d = safe_return(60)
         return_90d = safe_return(EXTRA_LONG_WINDOW)
 
-        # Volatilität (annualisiert)
         daily_returns = close.pct_change().dropna()
         volatility = float(daily_returns.std() * np.sqrt(252) * 100) if len(daily_returns) >= 5 else 20.0
 
-        # --- ATR (Average True Range, 14 Tage) ---
+        # ATR
         atr_14 = None
         try:
             if len(close) >= 15:
@@ -110,9 +84,9 @@ class MarketDataCollector:
                 tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
                 atr_14 = float(tr.rolling(14).mean().iloc[-1])
         except Exception:
-            atr_14 = None
+            pass
 
-        # --- MACD (12,26,9) ---
+        # MACD
         macd_line = macd_signal = macd_hist = None
         try:
             if len(close) >= 26:
@@ -126,9 +100,8 @@ class MarketDataCollector:
         except Exception:
             pass
 
-        # --- EMA12, EMA26 (zusätzlich für Crossover) ---
-        ema_12 = None
-        ema_26 = None
+        # EMA
+        ema_12 = ema_26 = None
         try:
             if len(close) >= 26:
                 ema_12 = float(close.ewm(span=12, adjust=False).mean().iloc[-1])
@@ -136,7 +109,7 @@ class MarketDataCollector:
         except Exception:
             pass
 
-        # --- Bollinger Bands (20,2σ) ---
+        # Bollinger
         bb_upper = bb_middle = bb_lower = bb_position = None
         try:
             if len(close) >= 20:
@@ -151,22 +124,18 @@ class MarketDataCollector:
         except Exception:
             pass
 
-        # Moving Averages
         sma_20 = float(close.tail(MEDIUM_WINDOW).mean()) if len(close) >= MEDIUM_WINDOW else None
         sma_50 = float(close.tail(LONG_WINDOW).mean()) if len(close) >= LONG_WINDOW else None
         sma_90 = float(close.tail(EXTRA_LONG_WINDOW).mean()) if len(close) >= EXTRA_LONG_WINDOW else None
-        sma_200 = float(close.tail(200).mean()) if len(close) >= 200 else None   # neu
-        sma_7  = float(close.tail(SHORT_WINDOW).mean()) if len(close) >= SHORT_WINDOW else current_price
+        sma_200 = float(close.tail(200).mean()) if len(close) >= 200 else None
+        sma_7 = float(close.tail(SHORT_WINDOW).mean()) if len(close) >= SHORT_WINDOW else current_price
 
-        # SMA distance
         sma_distance_pct = None
         if sma_50:
             sma_distance_pct = (current_price - sma_50) / sma_50 * 100
 
-        # RSI (14)
         rsi = self._calculate_rsi(close)
 
-        # Relative Strength vs SPY (20d)
         relative_strength = None
         if spy_close is not None and ticker != "SPY":
             try:
@@ -181,10 +150,7 @@ class MarketDataCollector:
             except Exception:
                 pass
 
-        # Average Volume
         avg_volume = float(df["Volume"].tail(20).mean()) if "Volume" in df else None
-
-        # Open Gap %
         open_gap_pct = None
         try:
             if "Open" in df and "Close" in df and len(df) >= 2:
@@ -195,12 +161,12 @@ class MarketDataCollector:
         except Exception:
             pass
 
-        # 52-week high/low
         high_52w = low_52w = None
         if len(close) >= 252:
             high_52w = float(close.tail(252).max())
             low_52w = float(close.tail(252).min())
 
+        # Immer ein Dictionary zurückgeben, auch wenn Werte fehlen
         return {
             "ticker": ticker,
             "current_price": current_price,
@@ -214,8 +180,7 @@ class MarketDataCollector:
             "sma_20": round(sma_20, 2) if sma_20 else None,
             "sma_50": round(sma_50, 2) if sma_50 else None,
             "sma_90": round(sma_90, 2) if sma_90 else None,
-            "sma_200": round(sma_200, 2) if sma_200 else None,   # neu
-            "sma_30": round(sma_50, 2) if sma_50 else None,  # legacy
+            "sma_200": round(sma_200, 2) if sma_200 else None,
             "above_sma_20": current_price > sma_20 if sma_20 else None,
             "above_sma_30": current_price > sma_50 if sma_50 else None,
             "above_sma_50": current_price > sma_50 if sma_50 else None,
@@ -231,9 +196,9 @@ class MarketDataCollector:
             "bb_middle": round(bb_middle, 4) if bb_middle is not None else None,
             "bb_lower": round(bb_lower, 4) if bb_lower is not None else None,
             "bb_position": round(bb_position, 4) if bb_position is not None else None,
-            "atr_14": round(atr_14, 4) if atr_14 is not None else None,           # neu
-            "ema_12": round(ema_12, 2) if ema_12 is not None else None,           # neu
-            "ema_26": round(ema_26, 2) if ema_26 is not None else None,           # neu
+            "atr_14": round(atr_14, 4) if atr_14 is not None else None,
+            "ema_12": round(ema_12, 2) if ema_12 is not None else None,
+            "ema_26": round(ema_26, 2) if ema_26 is not None else None,
             "open_gap_pct": round(open_gap_pct, 4) if open_gap_pct is not None else None,
             "high_52w": round(high_52w, 2) if high_52w else None,
             "low_52w": round(low_52w, 2) if low_52w else None,
@@ -241,18 +206,46 @@ class MarketDataCollector:
             "last_updated": datetime.now().isoformat(),
         }
 
-
-    def get_historical_returns(self, tickers: List[str], days: int = 252) -> Dict[str, np.ndarray]:
-        """Gibt historische tägliche Renditen als numpy arrays zurück."""
-        import numpy as np
-        returns = {}
-        for ticker in tickers:
-            df = self.fetch_price_history(ticker, days=days + 10)
-            if df is not None and len(df) > days:
-                close = df["Close"]
-                rets = close.pct_change().dropna().values[-days:]
-                returns[ticker] = rets
-        return returns
+    def _empty_metrics(self, ticker: str) -> Dict:
+        """Fallback für fehlende Daten – immer ein Dict, kein float."""
+        return {
+            "ticker": ticker,
+            "current_price": 0.0,
+            "return_7d": None,
+            "return_20d": None,
+            "return_30d": None,
+            "return_60d": None,
+            "return_90d": None,
+            "volatility_annual_pct": 20.0,
+            "sma_7": None,
+            "sma_20": None,
+            "sma_50": None,
+            "sma_90": None,
+            "sma_200": None,
+            "above_sma_20": None,
+            "above_sma_30": None,
+            "above_sma_50": None,
+            "above_sma_90": None,
+            "sma_distance_pct": None,
+            "rsi_14": None,
+            "relative_strength_vs_spy": None,
+            "avg_volume_20d": None,
+            "macd_line": None,
+            "macd_signal": None,
+            "macd_histogram": None,
+            "bb_upper": None,
+            "bb_middle": None,
+            "bb_lower": None,
+            "bb_position": None,
+            "atr_14": None,
+            "ema_12": None,
+            "ema_26": None,
+            "open_gap_pct": None,
+            "high_52w": None,
+            "low_52w": None,
+            "data_points": 0,
+            "last_updated": datetime.now().isoformat(),
+        }
 
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> Optional[float]:
         if len(prices) < period + 1:
@@ -265,11 +258,8 @@ class MarketDataCollector:
         return float(rsi.iloc[-1])
 
     def collect_all(self) -> Dict[str, Dict]:
-        """Sammelt Marktdaten für alle Assets und berechnet Relative Strength vs SPY."""
         log.info(f"Sammle Marktdaten für {len(self.watchlist)} Assets...")
-
-        # SPY zuerst laden (Benchmark für Relative Strength)
-        spy_close: Optional[pd.Series] = None
+        spy_close = None
         if "SPY" in self.watchlist:
             spy_df = self.fetch_price_history("SPY")
             if spy_df is not None:
@@ -279,17 +269,15 @@ class MarketDataCollector:
         for ticker in self.watchlist:
             log.debug(f"  → Lade {ticker}")
             metrics = self.calculate_metrics(ticker, spy_close=spy_close if ticker != "SPY" else None)
-            if metrics:
-                results[ticker] = metrics
-                log.debug(
-                    f"  ✓ {ticker}: ${metrics.get('current_price', 0):.2f} | "
-                    f"20d: {metrics.get('return_20d', 0) or 0:+.1f}% | "
-                    f"RSI: {metrics.get('rsi_14', 'n/a')} | "
-                    f"ATR: {metrics.get('atr_14', 'n/a')}"
-                )
+            # Sicherheitshalber: wenn metrics kein Dict ist, in Dummy umwandeln
+            if not isinstance(metrics, dict):
+                log.warning(f"  ✗ Ungültiges Format für {ticker}: {type(metrics)} – ersetze durch leeres Dict")
+                metrics = self._empty_metrics(ticker)
+            results[ticker] = metrics
+            if metrics.get("current_price", 0) > 0:
+                log.debug(f"  ✓ {ticker}: ${metrics.get('current_price', 0):.2f}")
             else:
-                log.warning(f"  ✗ Keine Daten für {ticker}")
-
+                log.warning(f"  ✗ Keine gültigen Daten für {ticker}")
         log.info(f"Marktdaten gesammelt: {len(results)}/{len(self.watchlist)} Assets.")
         return results
 
@@ -306,17 +294,25 @@ class MarketDataCollector:
             log.error(f"Fehler beim Abrufen des aktuellen Preises für {ticker}: {e}")
         return None
 
+    def get_historical_returns(self, tickers: List[str], days: int = 252) -> Dict[str, np.ndarray]:
+        import numpy as np
+        returns = {}
+        for ticker in tickers:
+            df = self.fetch_price_history(ticker, days=days + 10)
+            if df is not None and len(df) > days:
+                close = df["Close"]
+                rets = close.pct_change().dropna().values[-days:]
+                returns[ticker] = rets
+        return returns
+
     def _normalize_ohlcv_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize dataframe columns to standard OHLCV names."""
         try:
             if isinstance(df.columns, pd.MultiIndex):
                 df = df.copy()
                 df.columns = [c[0] if isinstance(c, tuple) and c[0] else "_".join([str(x) for x in c]).strip() for c in df.columns]
         except Exception:
             pass
-
         cols_lower = {c.lower(): c for c in df.columns}
-
         candidates = {
             "Open": ["open"],
             "High": ["high"],
@@ -324,7 +320,6 @@ class MarketDataCollector:
             "Close": ["adj close", "adjclose", "adj_close", "close"],
             "Volume": ["volume"],
         }
-
         rename_map = {}
         available = list(df.columns)
         for target, keys in candidates.items():
@@ -347,11 +342,9 @@ class MarketDataCollector:
             if found and found != target:
                 if target not in df.columns or ("adj" in found.lower() and target == "Close"):
                     rename_map[found] = target
-
         if rename_map:
             try:
                 df = df.rename(columns=rename_map)
             except Exception:
                 pass
-
         return df
