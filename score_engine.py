@@ -273,3 +273,40 @@ class ScoreEngine:
 def rank_assets(scores: Dict[str, ScoreBreakdown]) -> List[ScoreBreakdown]:
     """Gibt alle Assets absteigend nach total_score sortiert zurück."""
     return sorted(scores.values(), key=lambda x: x.total_score, reverse=True)
+
+
+def build_score_prompt_section(scores: Dict[str, ScoreBreakdown]) -> str:
+    """Erstellt den Score-Abschnitt für den LLM-Prompt."""
+    if not scores:
+        return ""
+    lines = ["=== QUANTITATIVE SCORES (deterministisch, vor KI-Interpretation) ==="]
+    lines.append(f"{'Ticker':<8} {'Score':>6} {'Signal':<12} {'RSI':>5} {'Mom20d':>8} {'SMA50dist':>10} {'Vola':>7} {'RS':>6} {'MACD':>8} {'BB':>5} {'Alloc':>7}")
+    lines.append("-" * 80)
+    for ticker, sb in sorted(scores.items(), key=lambda x: x[1].total_score, reverse=True):
+        rsi_str = f"{sb.rsi:.0f}" if sb.rsi is not None else "n/a"
+        mom_str = f"{sb.momentum_20d:+.1f}%" if sb.momentum_20d is not None else "n/a"
+        dist_str = f"{sb.sma_distance_pct:+.1f}%" if sb.sma_distance_pct is not None else "n/a"
+        vola_str = f"{sb.volatility_annual:.0f}%" if sb.volatility_annual is not None else "n/a"
+        rs_str = f"{sb.relative_strength:.2f}" if sb.relative_strength is not None else "n/a"
+        macd_str = f"{sb.macd_histogram:+.4f}" if sb.macd_histogram is not None else "n/a"
+        bb_str = f"{sb.bb_position:.2f}" if sb.bb_position is not None else "n/a"
+        alloc_str = f"{sb.current_alloc:.1%}"
+        lines.append(
+            f"{ticker:<8} {sb.total_score:>6.1f} {sb.signal:<12} "
+            f"{rsi_str:>5} {mom_str:>8} {dist_str:>10} {vola_str:>7} {rs_str:>6} {macd_str:>8} {bb_str:>5} {alloc_str:>7}"
+        )
+    lines.append("")
+    lines.append("Scoring-Legende: >75=STRONG_BUY | 60-75=BUY | 45-60=HOLD | 30-45=REDUCE | <30=SELL")
+    lines.append("Das LLM soll diese Scores berücksichtigen und nur bei starken Makro-Gründen abweichen.")
+    return "\n".join(lines)
+
+
+def rank_candidates(
+    scores: Dict[str, ScoreBreakdown],
+    min_score: float = 60.0,
+    top_k: int = 8,
+) -> List[ScoreBreakdown]:
+    """Gibt die Top-K Assets mit Score >= min_score zurück, sortiert absteigend."""
+    candidates = [sb for sb in scores.values() if sb.total_score >= min_score]
+    candidates.sort(key=lambda x: x.total_score, reverse=True)
+    return candidates[:top_k]
