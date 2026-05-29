@@ -1,11 +1,6 @@
 """
-AI Trading Bot - Quantitative Score Engine (vollständig)
-========================================================
-Enthält alle benötigten Klassen, Konstanten und Funktionen für:
-- ScoreBreakdown
-- ScoreEngine (Quant + AI + Momentum + Sentiment)
-- PortfolioOptimizer (für LLM-Prompt-Fallback)
-- Hilfsfunktionen build_score_prompt_section, rank_candidates
+AI Trading Bot - Quantitative Score Engine (robust)
+====================================================
 """
 
 import math
@@ -16,18 +11,12 @@ from logger import log
 from config import SECTOR_CLASSIFICATION, CORRELATION_GROUPS, RISK_SETTINGS, ACTIVE_RISK_PROFILE
 
 
-# ─────────────────────────────────────────────────────────────
-# KONSTANTEN
-# ─────────────────────────────────────────────────────────────
 SCORE_STRONG_BUY = 75
 SCORE_BUY = 60
 SCORE_HOLD = 45
 SCORE_REDUCE = 30
 
 
-# ─────────────────────────────────────────────────────────────
-# SCORE BREAKDOWN (für einzelne Assets)
-# ─────────────────────────────────────────────────────────────
 @dataclass
 class ScoreBreakdown:
     ticker: str
@@ -87,9 +76,6 @@ class ScoreBreakdown:
         return " | ".join(parts)
 
 
-# ─────────────────────────────────────────────────────────────
-# SCORE ENGINE (berechnet Scores für alle Assets)
-# ─────────────────────────────────────────────────────────────
 class ScoreEngine:
     def __init__(self, positions: Dict[str, Dict] = None, total_value: float = 100_000.0):
         self.positions = positions or {}
@@ -104,6 +90,10 @@ class ScoreEngine:
     ) -> Dict[str, ScoreBreakdown]:
         results = {}
         for ticker, data in market_data.items():
+            # Robustheit: data muss ein Dict sein, sonst überspringen
+            if not isinstance(data, dict):
+                log.warning(f"ScoreEngine: Ungültiger Datentyp für {ticker}: {type(data)} – übersprungen")
+                continue
             try:
                 sb = self._calculate_score(ticker, data, regime_state, ai_scores, sentiment_scores)
                 results[ticker] = sb
@@ -119,7 +109,8 @@ class ScoreEngine:
         ai_scores: Dict[str, float] = None,
         sentiment_scores: Dict[str, float] = None,
     ) -> ScoreBreakdown:
-        current_price = data.get("current_price") or 0.0
+        # Sichere Extraktion mit Defaults
+        current_price = data.get("current_price", 0.0) or 0.0
         rsi = data.get("rsi_14")
         return_20d = data.get("return_20d") or data.get("return_30d") or 0.0
         volatility = data.get("volatility_annual_pct") or 20.0
@@ -133,28 +124,17 @@ class ScoreEngine:
         pos = self.positions.get(ticker, {})
         current_alloc = pos.get("market_value", 0.0) / self.total_value if self.total_value > 0 else 0.0
 
-        # Quant Score
         quant_score = self._quant_score(data)
-
-        # AI Score
         ai_conf = (ai_scores or {}).get(ticker, 0.5)
         ai_score = ai_conf * 100
-
-        # Momentum Score
         momentum_score = self._momentum_score(return_20d)
-
-        # Sentiment Score
         sentiment = (sentiment_scores or {}).get(ticker, 0.0)
         sentiment_score = (sentiment + 1) * 50
-
-        # Risk Penalty
         risk_penalty = self._risk_penalty(volatility, rsi, current_alloc)
 
-        # Total Score (vereinfacht)
         total = quant_score * 0.45 + ai_score * 0.20 + momentum_score * 0.20 + sentiment_score * 0.05 - risk_penalty
         total = max(0.0, min(100.0, total))
 
-        # Signal & Action
         if total >= SCORE_STRONG_BUY:
             signal = "STRONG_BUY"
             action = "BUY"
@@ -198,12 +178,12 @@ class ScoreEngine:
         )
 
     def _quant_score(self, data: Dict) -> float:
-        rsi = data.get("rsi_14", 50)
+        rsi = data.get("rsi_14", 50) or 50
         return_20d = data.get("return_20d", 0) or 0
-        volatility = data.get("volatility_annual_pct", 20)
+        volatility = data.get("volatility_annual_pct", 20) or 20
         sma_dist = data.get("sma_distance_pct", 0) or 0
         score = 50.0
-        if rsi is not None:
+        if isinstance(rsi, (int, float)):
             if rsi < 30:
                 score += 15
             elif rsi > 70:
@@ -229,10 +209,11 @@ class ScoreEngine:
             penalty += 15
         elif volatility > 30:
             penalty += 8
-        if rsi is not None and rsi > 80:
-            penalty += 10
-        elif rsi is not None and rsi > 75:
-            penalty += 5
+        if rsi is not None:
+            if rsi > 80:
+                penalty += 10
+            elif rsi > 75:
+                penalty += 5
         if current_alloc > 0.20:
             penalty += (current_alloc - 0.20) * 100
         return min(30.0, penalty)
@@ -253,9 +234,6 @@ class ScoreEngine:
         return 0.0
 
 
-# ─────────────────────────────────────────────────────────────
-# HILFSFUNKTIONEN FÜR AI-ANALYSIS
-# ─────────────────────────────────────────────────────────────
 def rank_candidates(scores: Dict[str, ScoreBreakdown], min_score: float = SCORE_BUY, top_k: int = 8) -> List[ScoreBreakdown]:
     candidates = [sb for sb in scores.values() if sb.total_score >= min_score and sb.recommended_action == "BUY"]
     candidates.sort(key=lambda x: x.total_score, reverse=True)
@@ -282,9 +260,6 @@ def build_score_prompt_section(scores: Dict[str, ScoreBreakdown]) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────
-# PORTFOLIO OPTIMIZER (für Fallback in AI-Analysis)
-# ─────────────────────────────────────────────────────────────
 @dataclass
 class PortfolioAllocation:
     target_allocations: Dict[str, float]
@@ -320,8 +295,6 @@ class PortfolioOptimizer:
         market_confidence: float = 0.5,
         portfolio_risk_high: bool = False,
     ) -> PortfolioAllocation:
-        # Vereinfachte Implementierung für Fallback
-        # Nur Assets mit Score >= min_score_for_buy werden betrachtet
         candidates = []
         for ticker, sb in scores.items():
             if sb.total_score >= self.min_score_for_buy:
@@ -333,7 +306,6 @@ class PortfolioOptimizer:
             per_asset = investable / min(len(candidates), 5)
             for ticker, _ in candidates[:5]:
                 target[ticker] = min(per_asset, self.max_position_pct)
-        # Normalisierung
         total_target = sum(target.values())
         if total_target > investable:
             scale = investable / total_target
