@@ -87,6 +87,12 @@ class ScoreEngine:
         Bei ungültigen Daten (kein dict) wird ein Dummy-Score (50) zurückgegeben.
         Keine lauten Warnungen im Normalbetrieb – nur Debug-Logs.
         """
+
+        if not isinstance(ai_scores, dict):
+            ai_scores = {}
+        if not isinstance(sentiment_scores, dict):
+            sentiment_scores = {}
+        
         results = {}
         ai_scores = ai_scores or {}
         sentiment_scores = sentiment_scores or {}
