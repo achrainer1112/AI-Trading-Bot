@@ -74,7 +74,7 @@ RISK_SETTINGS = {
     RiskProfile.BALANCED: {
         "max_position_pct": 0.20,
         "min_cash_pct": 0.10,
-        "max_trades_per_run": 6,
+        "max_trades_per_run":10,    # !!!!!!!!!!!!! wurde von 5 auf 10 geändert !!!!!!!!!!!!!!!
         "stop_loss_pct": 0.08,
         "confidence_threshold": 0.60,
         "max_sector_exposure": 0.45,
