@@ -159,11 +159,15 @@ class TradingBot:
             positions=self.portfolio.positions,
             total_value=portfolio_summary_before.get("total_value", 100_000)
         )
+        
+        # Stelle sicher, dass ai_scores und sentiment_scores Dictionaries sind
+        ai_scores_dict = {}
+        sentiment_scores_dict = {}
         scores_obj = score_engine.score_all(
             market_data=market_data,
             regime_state=regime_state,
-            ai_scores={},
-            sentiment_scores={},
+            ai_scores=ai_scores_dict,
+            sentiment_scores=sentiment_scores_dict,
         )
         scores = {ticker: sb.total_score for ticker, sb in scores_obj.items()}
         momentums = {ticker: sb.momentum_20d or 0.0 for ticker, sb in scores_obj.items()}
