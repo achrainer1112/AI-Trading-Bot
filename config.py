@@ -1,7 +1,23 @@
 """
 AI Trading Bot - Konfigurationsdatei (final)
 =============================================
-Zentraler Konfigurationsort für alle Parameter.
+Enthält alle Parameter für:
+- Trading Modus
+- API Keys
+- Risikoprofile
+- Regime-abhängige Confidence Thresholds
+- Volatilitäts-Multiplier
+- Momentum-Boosting
+- Korrelations-Cluster
+- CVaR Risikomanagement
+- Zombie-Logik
+- Capital Rotation (Swap)
+- Rebalancing Engine
+- Dynamic Position Sizing
+- News & Sentiment
+- Backtesting
+- Dashboard
+- Top-N Score Portfolio Optimierung
 """
 
 import os
@@ -12,7 +28,7 @@ load_dotenv()
 # ─────────────────────────────────────────────
 # TRADING MODUS
 # ─────────────────────────────────────────────
-TRADING_MODE = os.getenv("TRADING_MODE", "LIVE")           # "PAPER", "LIVE", "DRY"
+TRADING_MODE = os.getenv("TRADING_MODE", "LIVE")
 ALLOW_LIVE_TRADING: bool = os.getenv("ALLOW_LIVE_TRADING", "false").strip().lower() == "true"
 KILL_SWITCH_DRAWDOWN_PCT: float = float(os.getenv("KILL_SWITCH_DRAWDOWN_PCT", "0.08"))
 
@@ -27,7 +43,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# RISIKOPROFILE (für RiskManager, VaR, Stop-Loss etc.)
+# RISIKOPROFILE (BALANCED als Standard)
 # ─────────────────────────────────────────────
 class RiskProfile(Enum):
     CONSERVATIVE = "conservative"
@@ -80,7 +96,7 @@ RISK_SETTINGS = {
     RiskProfile.AGGRESSIVE: {
         "max_position_pct": 0.30,
         "min_cash_pct": 0.05,
-        "max_trades_per_run": 15,
+        "max_trades_per_run": 10,
         "stop_loss_pct": 0.12,
         "confidence_threshold": 0.50,
         "max_sector_exposure": 0.55,
@@ -103,21 +119,7 @@ RISK_SETTINGS = {
 ACTIVE_RISK_PROFILE = RiskProfile.BALANCED
 
 # ─────────────────────────────────────────────
-# TOP-N SCORE PORTFOLIO OPTIMIERUNG (KERNLOGIK)
-# ─────────────────────────────────────────────
-MIN_SCORE_FOR_BUY = 50          # Assets unter diesem Score werden nicht gehalten (sofort verkauft)
-MAX_POSITION_COUNT = 8          # Maximal Anzahl von Positionen im Portfolio
-MAX_POSITION_PCT = 0.20         # Maximales Gewicht pro Asset (20%)
-MIN_CASH_PCT = 0.10             # Mindestens 10% Cash (wird immer gehalten)
-MIN_TRADE_VALUE = 10.0          # Absolute Untergrenze für Order (Alpaca fractional shares)
-
-# ─────────────────────────────────────────────
-# TRADE EXECUTION (wird von trade_executor.py benötigt)
-# ─────────────────────────────────────────────
-MIN_ORDER_VALUE = 10.0          # Mindestordervolumen in USD (Alpaca fractional shares)
-
-# ─────────────────────────────────────────────
-# REGIME-AWARE CONFIDENCE THRESHOLDS (für RiskManager, falls verwendet)
+# REGIME-AWARE CONFIDENCE THRESHOLDS
 # ─────────────────────────────────────────────
 REGIME_CONFIDENCE_THRESHOLDS = {
     "BULL": {"buy_threshold": 0.55, "sell_threshold": 0.70},
@@ -126,7 +128,7 @@ REGIME_CONFIDENCE_THRESHOLDS = {
 }
 
 # ─────────────────────────────────────────────
-# VOLATILITÄTS-MULTIPLIER (nicht aktiv im reinen Score-Modus, aber für Risiko)
+# VOLATILITÄTS-MULTIPLIER (für Position Sizing)
 # ─────────────────────────────────────────────
 VOLATILITY_MULTIPLIERS = {
     "very_low": {"max_vol": 15.0, "multiplier": 1.2},
@@ -135,30 +137,83 @@ VOLATILITY_MULTIPLIERS = {
     "high":     {"max_vol": 100.0, "multiplier": 0.4},
 }
 
-MOMENTUM_BOOST_ENABLED = False   # Im reinen Score-Modus nicht benötigt
-MOMENTUM_STRENGTH_THRESHOLD = 10.0
+MOMENTUM_BOOST_ENABLED = True
+MOMENTUM_BOOST_FACTOR = 1.2
+MOMENTUM_STRENGTH_THRESHOLD = 10.0   # in Prozent
 
 # ─────────────────────────────────────────────
-# CVAR RISK MANAGEMENT (optional, für zusätzliche Absicherung)
+# KORRELATIONS-CLUSTER (für Exposure Control)
 # ─────────────────────────────────────────────
-CVAR_LIMIT_PCT = 0.05
-CVAR_CONFIDENCE_LEVEL = 0.95
-CVAR_LOOKBACK_DAYS = 252
+CORRELATION_CLUSTERS = [
+    {"name": "mega_tech", "tickers": ["AAPL", "MSFT", "NVDA", "AMD", "QQQ", "XLK"]},
+    {"name": "financial", "tickers": ["JPM", "V", "MA", "XLF"]},
+    {"name": "healthcare", "tickers": ["XLV"]},
+    {"name": "defensive", "tickers": ["SPY", "VT"]},
+]
+
+MAX_CLUSTER_EXPOSURE = {
+    "mega_tech": 0.35,
+    "financial": 0.25,
+    "healthcare": 0.20,
+    "defensive": 0.50,
+}
 
 # ─────────────────────────────────────────────
-# ZOMBIE-LOGIK
+# CASH-MANAGEMENT (Regime-abhängig)
 # ─────────────────────────────────────────────
-ZOMBIE_POSITION_THRESHOLD = 50.0      # USD
-ZOMBIE_MIN_AGE_DAYS = 7               # Tage, bevor eine Position als Zombie gilt
+CASH_TARGET_BY_REGIME = {
+    "BULL": 0.07,
+    "SIDEWAYS": 0.15,
+    "BEAR": 0.30,
+}
 
 # ─────────────────────────────────────────────
-# COOLDOWN (verhindert zu häufiges Traden gleicher Assets)
+# CVAR RISK MANAGEMENT
 # ─────────────────────────────────────────────
-DEFAULT_ASSET_COOLDOWN_DAYS = 2
-COOLDOWN_FILE = "logs/trade_cooldowns.json"
+CVAR_LIMIT_PCT = 0.05          # 5% maximaler Expected Shortfall
+CVAR_CONFIDENCE_LEVEL = 0.95   # 95% Konfidenz
+CVAR_LOOKBACK_DAYS = 252       # 1 Jahr historische Daten
 
 # ─────────────────────────────────────────────
-# WATCHLIST & ASSET KLASSIFIKATION
+# ZOMBIE-LOGIK (Mindestalter)
+# ─────────────────────────────────────────────
+ZOMBIE_POSITION_THRESHOLD = 50.0   # USD
+ZOMBIE_MIN_AGE_DAYS = 7            # Mindestalter in Tagen
+ZOMBIE_MIN_RUNS = 5                # Alternative: Mindestanzahl Runs
+
+# ─────────────────────────────────────────────
+# CAPITAL ROTATION (SWAP-LOGIK)
+# ─────────────────────────────────────────────
+CAPITAL_ROTATION_ENABLED = True
+SWAP_MIN_SCORE_DIFF = 15.0         # Mindest-Score-Differenz für Swap
+SWAP_MAX_PER_RUN = 2
+SWAP_MIN_VALUE_USD = 100.0
+SWAP_MIN_HOLD_DAYS = 5
+
+# ─────────────────────────────────────────────
+# REBALANCING ENGINE (CPO)
+# ─────────────────────────────────────────────
+REBALANCING_ENGINE_ENABLED = True
+REBALANCING_MAX_TRADES = 5
+REBALANCING_MIN_DRIFT = 0.02       # 2% Mindestabweichung
+
+# ─────────────────────────────────────────────
+# DYNAMIC POSITION SIZING
+# ─────────────────────────────────────────────
+DYNAMIC_POSITION_SIZING_ENABLED = True
+VOLATILITY_TARGET = 0.15
+MAX_VOLATILITY_FACTOR = 2.0
+MIN_VOLATILITY_FACTOR = 0.5
+
+# ─────────────────────────────────────────────
+# SCORE ENGINE (wird von ai_analysis.py importiert)
+# ─────────────────────────────────────────────
+DEFAULT_MIN_BUY_SCORE = 60
+SCORE_TOP_K_CANDIDATES = 8
+LLM_SCORE_OVERRIDE_LIMIT = 15
+
+# ─────────────────────────────────────────────
+# WATCHLIST & ETFs
 # ─────────────────────────────────────────────
 ETF_WATCHLIST = ["SPY", "QQQ", "VT"]
 SECTOR_ETFS = ["XLV", "XLF", "XLE", "XLK"]
@@ -196,28 +251,38 @@ ETF_SECTOR_WEIGHTS = {
 ETF_FACTOR_WEIGHTS = ETF_SECTOR_WEIGHTS
 
 # ─────────────────────────────────────────────
-# PORTFOLIO & LOGGING
+# PORTFOLIO & TRADE EINSTELLUNGEN
 # ─────────────────────────────────────────────
 PORTFOLIO_FILE = "portfolio.json"
 TRADE_LOG_FILE = "logs/trades.json"
 PORTFOLIO_HISTORY_FILE = "logs/portfolio_history.json"
 LOG_DIR = "logs"
 
-INITIAL_CAPITAL = 100_000.0       # nur als Fallback, wird bei Sync überschrieben
+INITIAL_CAPITAL = 100_000.0
+MIN_ORDER_VALUE = 10.0           # reduziert für kleine Konten
 TRADE_FRICTION_PCT = 0.001
+TAX_ESTIMATE_PCT = 0.0
+DEFAULT_ASSET_COOLDOWN_DAYS = 2
+COOLDOWN_FILE = "logs/trade_cooldowns.json"
 
 # ─────────────────────────────────────────────
-# SCHEDULER (für automatische Runs)
+# PERFORMANCE TRACKING
+# ─────────────────────────────────────────────
+PERFORMANCE_FILE = "logs/performance_stats.json"
+SIGNAL_STATS_FILE = "logs/signal_stats.json"
+
+# ─────────────────────────────────────────────
+# SCHEDULER
 # ─────────────────────────────────────────────
 SCHEDULE_INTERVAL = "daily"
-SCHEDULE_TIME = "09:35"           # 09:35 Eastern Time (nach Marktöffnung)
+SCHEDULE_TIME = "09:35"
 SCHEDULE_WEEKDAY = 1
 MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 30
 MARKET_CLOSE_HOUR = 16
 
 # ─────────────────────────────────────────────
-# DATEN & BACKTEST
+# DATEN
 # ─────────────────────────────────────────────
 PRICE_HISTORY_DAYS = 120
 SHORT_WINDOW = 7
@@ -230,6 +295,9 @@ NEWS_TOPICS = [
     "energy prices", "federal reserve", "earnings", "GDP"
 ]
 
+# ─────────────────────────────────────────────
+# BACKTESTING
+# ─────────────────────────────────────────────
 BACKTEST_START_DATE = "2022-01-01"
 BACKTEST_END_DATE = "2024-01-01"
 BACKTEST_INITIAL_CAPITAL = 100_000.0
@@ -240,3 +308,9 @@ BACKTEST_COMMISSION = 0.001
 # ─────────────────────────────────────────────
 DASHBOARD_PORT = 8501
 ENABLE_DASHBOARD = True
+
+# ===== CPO Top-N Auswahl (neu) =====
+MIN_SCORE_FOR_BUY = 50          # Assets unter 50 werden ignoriert
+MAX_POSITION_COUNT = 8          # maximal 8 Positionen (kann auch 5 sein)
+MAX_POSITION_PCT = 0.20         # maximal 20% pro Asset
+MIN_CASH_PCT = 0.10             # mindestens 10% Cash
