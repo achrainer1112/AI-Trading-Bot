@@ -1,6 +1,8 @@
 """
 AI Trading Bot - Hauptprogramm (Top-N Score-basierte Portfolio-Optimierung)
-Zweiphasige Ausführung: SELLs → Broker-Sync → BUYs
+===========================================================================
+- Zweiphasen-Ausführung: SELLs → Broker-Sync → Zielgewichte neu berechnen → BUYs
+- Keine KI-Entscheidungen, keine Swap-Schwellen, keine Capital Rotation
 """
 
 import argparse
@@ -108,9 +110,7 @@ class TradingBot:
             run_summary["errors"].append("no_market_data")
             return run_summary
 
-        current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}  # <-- Hier definiert
-
-        # Historische Renditen für CVaR (optional)
+        # Historische Renditen für CVaR
         historical_returns = None
         if hasattr(self.data_collector, 'get_historical_returns'):
             try:
@@ -119,7 +119,7 @@ class TradingBot:
             except Exception as e:
                 log.warning(f"Historische Renditen nicht verfügbar: {e}")
 
-        # SCHRITT 2: News
+        # SCHRITT 2: News (nur für Journal)
         log.info("\nSCHRITT 2/8: News & Sentiment sammeln...")
         news_articles = self.news_collector.collect_all()
         news_text = self.news_collector.format_for_ai(news_articles)
@@ -130,7 +130,7 @@ class TradingBot:
         portfolio_summary_before = self._build_portfolio_summary()
         self.portfolio.print_summary()
 
-        # Zombies
+        # Zombies (Altersprüfung)
         zombie_tickers = find_zombie_positions(
             self.portfolio.positions,
             threshold=ZOMBIE_POSITION_THRESHOLD,
@@ -153,53 +153,19 @@ class TradingBot:
         scores = {ticker: sb.total_score for ticker, sb in scores_obj.items()}
         current_weights = self.portfolio.get_allocations()
         total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
+        current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
 
-        # SCHRITT 5: Top-N Portfolio-Optimierung
-        log.info("\nSCHRITT 5/8: Portfolio-Optimierung (Top-N Score-basiert)...")
+        # ========== 1. PHASE: SELLs identifizieren (alle Assets, die nicht in Top-N sind) ==========
         qualified_scores = {t: s for t, s in scores.items() if s >= MIN_SCORE_FOR_BUY}
         sorted_assets = sorted(qualified_scores.items(), key=lambda x: x[1], reverse=True)
-        top_assets = sorted_assets[:MAX_POSITION_COUNT]
+        top_assets = set(t for t, _ in sorted_assets[:MAX_POSITION_COUNT])
 
-        if top_assets:
-            base = {t: max(1.0, s - MIN_SCORE_FOR_BUY + 1) for t, s in top_assets}
-            total_base = sum(base.values())
-            investable = 1.0 - MIN_CASH_PCT
-            raw_targets = {t: (w / total_base) * investable for t, w in base.items()}
-            target_weights = {}
-            for t, w in raw_targets.items():
-                target_weights[t] = min(w, MAX_POSITION_PCT)
-            total_capped = sum(target_weights.values())
-            if total_capped > investable:
-                scale = investable / total_capped
-                target_weights = {t: w * scale for t, w in target_weights.items()}
-            cash_target = 1.0 - sum(target_weights.values())
-        else:
-            target_weights = {}
-            cash_target = 1.0
-
-        log.info(f"Zielportfolio: {len(target_weights)} Assets, Cash-Ziel {cash_target:.1%}")
-        for t, w in target_weights.items():
-            log.info(f"  {t}: {w:.1%} (Score {scores[t]:.0f})")
-
-        # Trades generieren
-        trades = []
-        for ticker, target in target_weights.items():
-            current = current_weights.get(ticker, 0.0)
-            delta = target - current
-            if abs(delta) < 0.005:
-                continue
-            action = "BUY" if delta > 0 else "SELL"
-            trades.append({
-                "ticker": ticker,
-                "action": action,
-                "target_allocation": target,
-                "confidence": 0.9,
-                "reason": f"Top-N Score: Ziel {target:.1%} vs aktuell {current:.1%}",
-                "risk_approved": True,
-            })
+        sell_candidates = []
         for ticker, current in current_weights.items():
-            if ticker not in target_weights and current > 0:
-                trades.append({
+            if ticker == "CASH":
+                continue
+            if current > 0 and ticker not in top_assets:
+                sell_candidates.append({
                     "ticker": ticker,
                     "action": "SELL",
                     "target_allocation": 0.0,
@@ -208,149 +174,170 @@ class TradingBot:
                     "risk_approved": True,
                 })
 
-        trades.extend(zombie_orders)
-        trades, cooldown_warnings = cooldown_manager.filter_decisions(trades)
+        # Zombie-Orders hinzufügen (falls welche)
+        sell_candidates.extend(zombie_orders)
+
+        # Cooldown-Filter für SELLs
+        sell_candidates, cooldown_warnings = cooldown_manager.filter_decisions(sell_candidates)
         if cooldown_warnings:
             run_summary["cooldown_warnings"] = cooldown_warnings
 
-        # ========== AUSFÜHRUNG ==========
         execution_enabled = (
             not analysis_only
             and self.mode in ("PAPER", "REAL", "LIVE")
             and self.executor.api is not None
         )
 
-        if not execution_enabled:
-            log.info("Execution disabled – nur Simulation")
-            validated, risk_warnings = self.risk_manager.validate_decisions(
-                decisions=trades,
-                portfolio_summary=portfolio_summary_before,
-                market_data=market_data,
-                historical_returns=historical_returns,
-            )
-            run_summary["risk_warnings"] = risk_warnings
-            planned_trades = self._simulate_trades(trades, current_prices, total_value, current_weights)
-            executed_records = []
-            sells_ok = buys_ok = 0
-        else:
-            sell_trades = [t for t in trades if t["action"] == "SELL"]
-            buy_trades = [t for t in trades if t["action"] == "BUY"]
-
-            # Phase 1: SELLs
-            log.info(f"\n  ── Phase 1: SELLs ({len(sell_trades)} Trades) ──")
+        # ========== SELLs validieren und ausführen ==========
+        sells_executed = 0
+        if execution_enabled and sell_candidates:
+            log.info(f"\n  ── Phase 1: SELLs ({len(sell_candidates)} Trades) ──")
             validated_sells, sell_warnings = self.risk_manager.validate_decisions(
-                decisions=sell_trades,
+                decisions=sell_candidates,
                 portfolio_summary=portfolio_summary_before,
                 market_data=market_data,
                 historical_returns=historical_returns,
             )
-            run_summary["risk_warnings"] = sell_warnings
+            run_summary["risk_warnings"].extend(sell_warnings)
 
-            executed_records = []
-            sells_ok = 0
             for d in validated_sells:
                 if d.get("action") != "SELL" or not d.get("risk_approved"):
                     continue
+                price = current_prices.get(d["ticker"], 0)
+                if price <= 0:
+                    continue
                 ok, record = self._execute_sell_trade(d, current_prices)
-                if record.get("status") == "EXECUTED":
-                    executed_records.append(record)
-                if ok:
-                    sells_ok += 1
-                    self.portfolio.apply_trade(
-                        ticker=d["ticker"],
-                        action="SELL",
-                        quantity=record.get("fill_qty") or d.get("quantity", 0),
-                        price=record.get("fill_price") or current_prices.get(d["ticker"], 0),
-                    )
-            run_summary["sells_executed"] = sells_ok
-
-            # Broker-Sync
-            if sells_ok > 0:
+                if ok and record.get("status") == "EXECUTED":
+                    sells_executed += 1
+                    run_summary["sells_executed"] = sells_executed
+            # Broker-Sync nach SELLs
+            if sells_executed > 0:
                 log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
                 time.sleep(2)
                 self.portfolio._load_from_alpaca()
                 log.info(f"  Sync: Cash nach SELLs = {format_currency(self.portfolio.cash)}")
-                # Aktualisiere Portfolio
-                portfolio_summary_after_sells = self._build_portfolio_summary()
-                total_value = portfolio_summary_after_sells.get("total_value", self.portfolio.get_total_value())
+                # Portfolio-Zustand aktualisieren
+                portfolio_summary_before = self._build_portfolio_summary()
+                total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
                 current_weights = self.portfolio.get_allocations()
-                cash = self.portfolio.cash
-            else:
-                portfolio_summary_after_sells = portfolio_summary_before
-                cash = self.portfolio.cash
+        else:
+            log.info("\n  ── Phase 1: Keine SELLs – überspringe")
 
-            # Phase 3: BUYs mit aktualisiertem Cash
-            if buy_trades:
-                log.info(f"\n  ── Phase 3: BUYs ({len(buy_trades)} Trades) mit aktualisiertem Cash ──")
-                validated_buys, buy_warnings = self.risk_manager.validate_decisions(
-                    decisions=buy_trades,
-                    portfolio_summary=portfolio_summary_after_sells,
-                    market_data=market_data,
-                    historical_returns=historical_returns,
+        # ========== NEUE ZIELGEWICHTE NACH SELLS berechnen ==========
+        # Nur noch Assets, die tatsächlich im Portfolio sind (oder neu gekauft werden sollen)
+        qualified_scores_after = {t: s for t, s in scores.items() if s >= MIN_SCORE_FOR_BUY}
+        sorted_assets_after = sorted(qualified_scores_after.items(), key=lambda x: x[1], reverse=True)
+        top_assets_after = sorted_assets_after[:MAX_POSITION_COUNT]
+
+        target_weights = {}
+        if top_assets_after:
+            base = {t: max(1.0, s - MIN_SCORE_FOR_BUY + 1) for t, s in top_assets_after}
+            total_base = sum(base.values())
+            investable = 1.0 - MIN_CASH_PCT
+            raw_targets = {t: (w / total_base) * investable for t, w in base.items()}
+            for t, w in raw_targets.items():
+                target_weights[t] = min(w, MAX_POSITION_PCT)
+            total_capped = sum(target_weights.values())
+            if total_capped > investable:
+                scale = investable / total_capped
+                target_weights = {t: w * scale for t, w in target_weights.items()}
+            cash_target = 1.0 - sum(target_weights.values())
+        else:
+            cash_target = 1.0
+
+        log.info(f"\nZielportfolio nach SELLs: {len(target_weights)} Assets, Cash-Ziel {cash_target:.1%}")
+        for t, w in target_weights.items():
+            log.info(f"  {t}: {w:.1%} (Score {scores[t]:.0f})")
+
+        # ========== BUY-Kandidaten aus Differenz generieren ==========
+        buy_candidates = []
+        for ticker, target in target_weights.items():
+            current = current_weights.get(ticker, 0.0)
+            delta = target - current
+            if delta > 0.005:   # mindestens 0.5% Aufstockung
+                buy_candidates.append({
+                    "ticker": ticker,
+                    "action": "BUY",
+                    "target_allocation": target,
+                    "confidence": 0.9,
+                    "reason": f"Top-N Score: Ziel {target:.1%} vs aktuell {current:.1%}",
+                    "risk_approved": True,
+                })
+
+        # Cooldown-Filter für BUYs
+        buy_candidates, cooldown_warnings = cooldown_manager.filter_decisions(buy_candidates)
+        if cooldown_warnings:
+            run_summary["cooldown_warnings"] = run_summary.get("cooldown_warnings", []) + cooldown_warnings
+
+        # ========== BUYs validieren und ausführen ==========
+        buys_executed = 0
+        if execution_enabled and buy_candidates:
+            log.info(f"\n  ── Phase 3: BUYs ({len(buy_candidates)} Trades) mit aktualisiertem Cash ──")
+            # Aktualisiere Portfolio-Summary für BUYs (mit aktuellem Cash und Positionen)
+            portfolio_summary_for_buys = self._build_portfolio_summary()
+            validated_buys, buy_warnings = self.risk_manager.validate_decisions(
+                decisions=buy_candidates,
+                portfolio_summary=portfolio_summary_for_buys,
+                market_data=market_data,
+                historical_returns=historical_returns,
+            )
+            run_summary["risk_warnings"].extend(buy_warnings)
+
+            total_value = portfolio_summary_for_buys.get("total_value", self.portfolio.get_total_value())
+            min_cash_abs = max(0.0, total_value * MIN_CASH_PCT)
+            running_cash = self.portfolio.cash
+
+            for d in validated_buys:
+                if d.get("action") != "BUY" or not d.get("risk_approved"):
+                    continue
+                ticker = d["ticker"]
+                target_alloc = d.get("target_allocation", 0)
+                current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0)
+                buy_cost = max(0, total_value * target_alloc - current_val)
+                price = current_prices.get(ticker, 0)
+                if price <= 0:
+                    continue
+                spendable = max(0.0, running_cash - min_cash_abs)
+                if spendable < buy_cost:
+                    buy_cost = spendable
+                if buy_cost < 1.0:
+                    continue
+                ok, record = self.executor.execute_buy(
+                    ticker=ticker,
+                    target_value=buy_cost,
+                    current_price=price,
+                    available_cash=running_cash,
+                    min_cash_reserve=min_cash_abs,
+                    reason=d.get("reason", "Top-N Score Rebalancing"),
                 )
-                run_summary["risk_warnings"].extend(buy_warnings)
-
-                buys_ok = 0
-                min_cash_pct = self.risk_manager.settings.get("min_cash_pct", MIN_CASH_PCT)
-                min_cash_abs = max(0.0, total_value * min_cash_pct)
-                running_cash = cash
-
-                for d in validated_buys:
-                    if d.get("action") != "BUY" or not d.get("risk_approved"):
-                        continue
-                    ticker = d["ticker"]
-                    target_alloc = d.get("target_allocation", 0)
-                    current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0)
-                    buy_cost = max(0, total_value * target_alloc - current_val)
-                    price = current_prices.get(ticker, 0)
-                    if price <= 0:
-                        continue
-                    spendable = max(0.0, running_cash - min_cash_abs)
-                    if spendable < buy_cost:
-                        buy_cost = spendable
-                    if buy_cost < 1.0:
-                        continue
-                    ok, record = self.executor.execute_buy(
+                if ok and record.get("status") == "EXECUTED":
+                    buys_executed += 1
+                    actual_spent = record.get("fill_value") or buy_cost
+                    running_cash -= actual_spent
+                    self.portfolio.apply_trade(
                         ticker=ticker,
-                        target_value=buy_cost,
-                        current_price=price,
-                        available_cash=running_cash,
-                        min_cash_reserve=min_cash_abs,
-                        reason=d.get("reason", "Top-N Score Rebalancing"),
+                        action="BUY",
+                        quantity=record.get("fill_qty") or (actual_spent / price if price > 0 else 0),
+                        price=record.get("fill_price") or price,
                     )
-                    if record.get("status") == "EXECUTED":
-                        executed_records.append(record)
-                    if ok:
-                        buys_ok += 1
-                        actual_spent = record.get("fill_value") or buy_cost
-                        running_cash -= actual_spent
-                        self.portfolio.apply_trade(
-                            ticker=ticker,
-                            action="BUY",
-                            quantity=record.get("fill_qty") or (actual_spent / price if price > 0 else 0),
-                            price=record.get("fill_price") or price,
-                        )
-                run_summary["buys_executed"] = buys_ok
+            run_summary["buys_executed"] = buys_executed
 
-            run_summary["trades_executed"] = sells_ok + buys_ok
-            run_summary["execution_mode"] = "LIVE"
-            validated = validated_sells + validated_buys
-            planned_trades = self._simulate_trades(trades, current_prices, total_value, current_weights)
-
-        # Konsistenzprüfung
+        # Finale Portfolio-Konsistenz
         self._check_portfolio_consistency(market_data)
         portfolio_summary_after = self._build_portfolio_summary()
         trade_logger.log_portfolio_snapshot(portfolio_summary_after)
 
+        # Portfolio-Report
         self._print_portfolio_report(current_weights, target_weights, scores)
 
+        # Journal
         journal.log_run(
             market_outlook="Top-N Score-basierte Optimierung",
             risk_assessment="System hält die besten Assets basierend auf quantitativem Score",
             ai_signals=[],
-            final_decisions=validated if execution_enabled else [],
-            simulated_trades=planned_trades if execution_enabled else [],
-            executed_trades=executed_records if execution_enabled else [],
+            final_decisions=[],  # nicht benötigt
+            simulated_trades=[],
+            executed_trades=[],
             portfolio_before=portfolio_summary_before,
             portfolio_after=portfolio_summary_after,
             portfolio_projection=None,
@@ -359,7 +346,7 @@ class TradingBot:
             feedback_learnings="",
             regime_state=regime_state,
             market_data=market_data,
-            execution_mode=run_summary.get("execution_mode", "SIMULATED"),
+            execution_mode="LIVE" if execution_enabled else "SIMULATED",
             market_closed=analysis_only,
             risk_manager=self.risk_manager,
         )
@@ -382,54 +369,7 @@ class TradingBot:
 
         return run_summary
 
-    # Hilfsmethoden (wie gehabt, aber mit korrekten Referenzen)
-    def _simulate_trades(self, trades, current_prices, total_value, current_weights):
-        simulated = []
-        for t in trades:
-            price = current_prices.get(t["ticker"], 0)
-            if price <= 0:
-                continue
-            value = t.get("target_allocation", 0) * total_value
-            simulated.append({
-                "ticker": t["ticker"],
-                "action": t["action"],
-                "target_alloc": t.get("target_allocation", 0),
-                "value": value,
-                "quantity": value / price if price > 0 else 0,
-                "price": price,
-                "current_alloc": current_weights.get(t["ticker"], 0),
-                "ai_reason": t.get("reason", ""),
-                "ai_confidence": t.get("confidence", 0),
-            })
-        return simulated
-
-    def _final_execution_guard(self, sell_trades, buy_trades, portfolio_summary):
-        warnings = []
-        _profile = RISK_SETTINGS[ACTIVE_RISK_PROFILE]
-        max_position_pct = _profile.get("max_position_pct", MAX_POSITION_PCT)
-        min_cash_pct = _profile.get("min_cash_pct", MIN_CASH_PCT)
-        total_value = portfolio_summary.get("total_value", self.portfolio.get_total_value())
-        min_cash_abs = total_value * min_cash_pct
-        available_cash = portfolio_summary.get("cash", self.portfolio.cash)
-        total_buy_value = sum(t.get("value", 0) for t in buy_trades)
-        projected_cash = available_cash - total_buy_value
-        if projected_cash < min_cash_abs:
-            scale = max(0.0, (available_cash - min_cash_abs) / total_buy_value) if total_buy_value > 0 else 0
-            for trade in buy_trades:
-                trade["value"] = round(trade.get("value", 0) * scale, 2)
-        for trade in buy_trades:
-            ticker = trade.get("ticker", "")
-            current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0.0)
-            buy_val = trade.get("value", 0.0)
-            projected_val = current_val + buy_val
-            cap_val = total_value * max_position_pct
-            if projected_val > cap_val:
-                clamped = max(0.0, cap_val - current_val)
-                trade["value"] = round(clamped, 2)
-                warnings.append(f"Cap guard: {ticker} {current_val:,.0f}→{projected_val:,.0f} > cap {cap_val:,.0f}")
-        buy_trades = [t for t in buy_trades if t.get("value", 0) >= 1.0]
-        return sell_trades, buy_trades, warnings
-
+    # Hilfsmethoden
     def _check_portfolio_consistency(self, market_data):
         if self.mode not in ("PAPER", "REAL", "LIVE") or not self.executor.api:
             return
@@ -461,9 +401,9 @@ class TradingBot:
             ticker=ticker,
             position_qty=position_qty,
             current_price=price,
-            target_value=trade.get("value", 0),
+            target_value=0.0,   # vollständiger Verkauf
             reason=trade.get("reason", "Top-N Score Rebalancing"),
-            full_liquidation=is_zombie,
+            full_liquidation=True,
         )
 
     def _print_portfolio_report(self, current_weights: Dict, target_weights: Dict, scores: Dict):
