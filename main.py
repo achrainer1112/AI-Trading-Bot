@@ -1,12 +1,6 @@
 """
 AI Trading Bot - Hauptprogramm (Top-N Score-basierte Portfolio-Optimierung)
-===========================================================================
-- Berechnet Scores für alle Assets (quantitativ)
-- Wählt die besten N Assets (z.B. 5) mit Score >= MIN_SCORE aus
-- Zielgewichte proportional zu Score (höherer Score = größere Position)
-- Trades werden ausschließlich aus Ziel- vs. Ist-Gewichten generiert
-- Keine KI-Entscheidungen mehr, keine Swap-Schwellen, keine Capital Rotation
-- Zweiphasige Ausführung: SELLs → Broker-Sync → BUYs
+Zweiphasige Ausführung: SELLs → Broker-Sync → BUYs
 """
 
 import argparse
@@ -94,7 +88,7 @@ class TradingBot:
             "analysis_only": analysis_only,
         }
 
-        # SCHRITT 0: Markt-Regime (optional für Risikomanagement)
+        # SCHRITT 0: Markt-Regime
         log.info("SCHRITT 0/8: Markt-Regime-Detektion...")
         try:
             regime_detector = EnhancedMarketRegimeDetector(watchlist=FULL_WATCHLIST)
@@ -114,6 +108,8 @@ class TradingBot:
             run_summary["errors"].append("no_market_data")
             return run_summary
 
+        current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}  # <-- Hier definiert
+
         # Historische Renditen für CVaR (optional)
         historical_returns = None
         if hasattr(self.data_collector, 'get_historical_returns'):
@@ -123,7 +119,7 @@ class TradingBot:
             except Exception as e:
                 log.warning(f"Historische Renditen nicht verfügbar: {e}")
 
-        # SCHRITT 2: News (nur für Journal)
+        # SCHRITT 2: News
         log.info("\nSCHRITT 2/8: News & Sentiment sammeln...")
         news_articles = self.news_collector.collect_all()
         news_text = self.news_collector.format_for_ai(news_articles)
@@ -134,7 +130,7 @@ class TradingBot:
         portfolio_summary_before = self._build_portfolio_summary()
         self.portfolio.print_summary()
 
-        # Zombies (Altersprüfung)
+        # Zombies
         zombie_tickers = find_zombie_positions(
             self.portfolio.positions,
             threshold=ZOMBIE_POSITION_THRESHOLD,
@@ -185,7 +181,7 @@ class TradingBot:
         for t, w in target_weights.items():
             log.info(f"  {t}: {w:.1%} (Score {scores[t]:.0f})")
 
-        # SCHRITT 6: Trades aus Differenz generieren
+        # Trades generieren
         trades = []
         for ticker, target in target_weights.items():
             current = current_weights.get(ticker, 0.0)
@@ -201,7 +197,6 @@ class TradingBot:
                 "reason": f"Top-N Score: Ziel {target:.1%} vs aktuell {current:.1%}",
                 "risk_approved": True,
             })
-        # Assets, die nicht mehr in Top-N sind, werden verkauft
         for ticker, current in current_weights.items():
             if ticker not in target_weights and current > 0:
                 trades.append({
@@ -213,15 +208,12 @@ class TradingBot:
                     "risk_approved": True,
                 })
 
-        # Zombie-Orders hinzufügen
         trades.extend(zombie_orders)
-
-        # Cooldown-Filter (zeitbasiert)
         trades, cooldown_warnings = cooldown_manager.filter_decisions(trades)
         if cooldown_warnings:
             run_summary["cooldown_warnings"] = cooldown_warnings
 
-        # ========== ZWEIPHASEN-AUSFÜHRUNG ==========
+        # ========== AUSFÜHRUNG ==========
         execution_enabled = (
             not analysis_only
             and self.mode in ("PAPER", "REAL", "LIVE")
@@ -230,7 +222,6 @@ class TradingBot:
 
         if not execution_enabled:
             log.info("Execution disabled – nur Simulation")
-            # Trotzdem Risikoprüfung für Logging
             validated, risk_warnings = self.risk_manager.validate_decisions(
                 decisions=trades,
                 portfolio_summary=portfolio_summary_before,
@@ -238,13 +229,14 @@ class TradingBot:
                 historical_returns=historical_returns,
             )
             run_summary["risk_warnings"] = risk_warnings
-            # Simulations-Trades für Journal
             planned_trades = self._simulate_trades(trades, current_prices, total_value, current_weights)
+            executed_records = []
+            sells_ok = buys_ok = 0
         else:
-            # Phase 1: SELLs validieren und ausführen
             sell_trades = [t for t in trades if t["action"] == "SELL"]
             buy_trades = [t for t in trades if t["action"] == "BUY"]
 
+            # Phase 1: SELLs
             log.info(f"\n  ── Phase 1: SELLs ({len(sell_trades)} Trades) ──")
             validated_sells, sell_warnings = self.risk_manager.validate_decisions(
                 decisions=sell_trades,
@@ -254,15 +246,10 @@ class TradingBot:
             )
             run_summary["risk_warnings"] = sell_warnings
 
-            # SELLs ausführen
             executed_records = []
             sells_ok = 0
             for d in validated_sells:
                 if d.get("action") != "SELL" or not d.get("risk_approved"):
-                    continue
-                price = current_prices.get(d["ticker"], d.get("price", 0))
-                pos = self.portfolio.positions.get(d["ticker"])
-                if not pos or pos.get("quantity", 0) <= 0:
                     continue
                 ok, record = self._execute_sell_trade(d, current_prices)
                 if record.get("status") == "EXECUTED":
@@ -273,24 +260,26 @@ class TradingBot:
                         ticker=d["ticker"],
                         action="SELL",
                         quantity=record.get("fill_qty") or d.get("quantity", 0),
-                        price=record.get("fill_price") or price,
+                        price=record.get("fill_price") or current_prices.get(d["ticker"], 0),
                     )
             run_summary["sells_executed"] = sells_ok
 
-            # Broker-Sync nach SELLs
+            # Broker-Sync
             if sells_ok > 0:
                 log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
                 time.sleep(2)
                 self.portfolio._load_from_alpaca()
                 log.info(f"  Sync: Cash nach SELLs = {format_currency(self.portfolio.cash)}")
-                # Aktualisiere Portfolio für BUYs
+                # Aktualisiere Portfolio
                 portfolio_summary_after_sells = self._build_portfolio_summary()
                 total_value = portfolio_summary_after_sells.get("total_value", self.portfolio.get_total_value())
                 current_weights = self.portfolio.get_allocations()
+                cash = self.portfolio.cash
             else:
                 portfolio_summary_after_sells = portfolio_summary_before
+                cash = self.portfolio.cash
 
-            # Phase 3: BUYs mit aktualisiertem Cash validieren und ausführen
+            # Phase 3: BUYs mit aktualisiertem Cash
             if buy_trades:
                 log.info(f"\n  ── Phase 3: BUYs ({len(buy_trades)} Trades) mit aktualisiertem Cash ──")
                 validated_buys, buy_warnings = self.risk_manager.validate_decisions(
@@ -302,11 +291,9 @@ class TradingBot:
                 run_summary["risk_warnings"].extend(buy_warnings)
 
                 buys_ok = 0
-                total_value = portfolio_summary_after_sells.get("total_value", self.portfolio.get_total_value())
                 min_cash_pct = self.risk_manager.settings.get("min_cash_pct", MIN_CASH_PCT)
                 min_cash_abs = max(0.0, total_value * min_cash_pct)
-                running_cash = self.portfolio.cash
-                current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
+                running_cash = cash
 
                 for d in validated_buys:
                     if d.get("action") != "BUY" or not d.get("risk_approved"):
@@ -347,23 +334,16 @@ class TradingBot:
 
             run_summary["trades_executed"] = sells_ok + buys_ok
             run_summary["execution_mode"] = "LIVE"
-
-            # Für Journal: alle validierten Entscheidungen zusammenführen
             validated = validated_sells + validated_buys
-            # Simulierte Trades für Journal (optional, hier einfach die geplanten Trades)
             planned_trades = self._simulate_trades(trades, current_prices, total_value, current_weights)
 
-        # Abschließende Konsistenzprüfung
+        # Konsistenzprüfung
         self._check_portfolio_consistency(market_data)
-
-        # Portfolio-Snapshot nach Trades
         portfolio_summary_after = self._build_portfolio_summary()
         trade_logger.log_portfolio_snapshot(portfolio_summary_after)
 
-        # Portfolio-Report
         self._print_portfolio_report(current_weights, target_weights, scores)
 
-        # Journal
         journal.log_run(
             market_outlook="Top-N Score-basierte Optimierung",
             risk_assessment="System hält die besten Assets basierend auf quantitativem Score",
@@ -402,9 +382,8 @@ class TradingBot:
 
         return run_summary
 
-    # Hilfsmethoden
+    # Hilfsmethoden (wie gehabt, aber mit korrekten Referenzen)
     def _simulate_trades(self, trades, current_prices, total_value, current_weights):
-        """Simuliert Trades für Journal (wenn keine echte Ausführung)"""
         simulated = []
         for t in trades:
             price = current_prices.get(t["ticker"], 0)
