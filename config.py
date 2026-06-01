@@ -307,3 +307,10 @@ BACKTEST_COMMISSION = 0.001
 # ─────────────────────────────────────────────
 DASHBOARD_PORT = 8501
 ENABLE_DASHBOARD = True
+
+
+# ===== CPO Top-N Auswahl =====
+MIN_SCORE_FOR_BUY = 50          # Assets unter 50 werden ignoriert
+MAX_POSITION_COUNT = 8          # maximal 8 Positionen (kann auch 5 sein)
+MAX_POSITION_PCT = 0.20         # maximal 20% pro Asset
+MIN_CASH_PCT = 0.10             # mindestens 10% Cash
