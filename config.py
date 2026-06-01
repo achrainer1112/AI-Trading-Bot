@@ -112,6 +112,11 @@ MIN_CASH_PCT = 0.10             # Mindestens 10% Cash (wird immer gehalten)
 MIN_TRADE_VALUE = 10.0          # Absolute Untergrenze für Order (Alpaca fractional shares)
 
 # ─────────────────────────────────────────────
+# TRADE EXECUTION (wird von trade_executor.py benötigt)
+# ─────────────────────────────────────────────
+MIN_ORDER_VALUE = 10.0          # Mindestordervolumen in USD (Alpaca fractional shares)
+
+# ─────────────────────────────────────────────
 # REGIME-AWARE CONFIDENCE THRESHOLDS (für RiskManager, falls verwendet)
 # ─────────────────────────────────────────────
 REGIME_CONFIDENCE_THRESHOLDS = {
