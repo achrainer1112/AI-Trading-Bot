@@ -13,6 +13,8 @@ import json
 import time
 from datetime import datetime
 from typing import Dict, List, Tuple
+import warnings
+warnings.filterwarnings("ignore", message=".*Timestamp.utcnow is deprecated.*")
 
 from logger import log, trade_logger
 from config import (
