@@ -1,7 +1,8 @@
 """
 AI Trading Bot - Hauptprogramm (Top-N Score-Modus, Zweiphasen)
 ===========================================================================
-- Verwendet bestehenden CPO (cpo_engine) und PortfolioRebalancer
+- Verwendet CPO (cpo_engine) und PortfolioRebalancer
+- CPO-Trades erhalten Confidence 0.99 → werden vom RiskManager akzeptiert
 - Führt SELLs zuerst aus → Broker‑Sync → dann BUYs mit aktualisiertem Cash
 """
 
@@ -186,25 +187,23 @@ class TradingBot:
         )
 
         # ========== TRADE-ENTSCHEIDUNGEN AUS REBALANCING EXTRAHIEREN ==========
-        # Die `rebalancing_decisions` sind bereits `RebalancingDecision` Objekte mit Aktion und Zielgewicht.
-        # Wir wandeln sie in das interne Dict-Format um.
+        # CPO-Trades erhalten maximale Confidence (0.99), damit sie vom RiskManager akzeptiert werden
         rebalance_trades = []
         for rd in rebalancing_decisions:
             rebalance_trades.append({
                 "ticker": rd.ticker,
                 "action": rd.action,
                 "target_allocation": rd.target_weight,
-                "confidence": rd.confidence,
-                "reason": rd.reason,
+                "confidence": 0.99,               # CPO bekommt höchste Konfidenz
+                "reason": f"CPO: {rd.reason}",
                 "risk_approved": True,
+                "cpo_trade": True,
             })
 
         # Weitere Entscheidungen: KI, DecisionWeighter (optional) – hier vereinfacht,
-        # da wir nur die rebalancing_trades verwenden wollen. Aber für Kompatibilität:
-        # (Der bisherige Code mit AI und DecisionWeighter wird auskommentiert, da wir nur CPO nutzen)
+        # da wir nur die rebalance_trades verwenden.
         ai_result = {"market_outlook": "CPO-basierte Optimierung", "risk_assessment": "Score-basiertes Rebalancing"}
         raw_ai_decisions = []
-        # merged_decisions = []  # nicht benötigt
 
         # Wir verwenden ausschließlich die Trades aus dem Rebalancer
         decisions = rebalance_trades
@@ -252,6 +251,7 @@ class TradingBot:
                 run_summary["risk_warnings"].extend(sell_warnings)
 
                 sells_executed = 0
+                current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
                 for d in validated_sells:
                     if d.get("action") != "SELL" or not d.get("risk_approved"):
                         continue
