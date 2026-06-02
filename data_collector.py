@@ -1,12 +1,9 @@
 """
-AI Trading Bot - Marktdaten-Collector (robust)
-================================================
-Sammelt Marktdaten und stellt sicher, dass jeder Eintrag ein Dict ist.
+AI Trading Bot - Marktdaten-Collector (ultimativ robust)
+=========================================================
+Stellt sicher, dass collect_all() immer ein Dict mit Dict-Werten zurückgibt.
+Keine floats, keine None, keine leeren Werte – immer ein vollständiges Dict.
 """
-
-import warnings
-warnings.filterwarnings("ignore", category=Warning, module="yfinance")
-warnings.filterwarnings("ignore", message=".*Timestamp.utcnow is deprecated.*")
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -22,7 +19,7 @@ from config import (
 try:
     import yfinance as yf
 except ImportError:
-    log.error("yfinance nicht installiert. Führe aus: pip install yfinance")
+    log.error("yfinance nicht installiert")
     raise
 
 
@@ -30,26 +27,6 @@ class MarketDataCollector:
     def __init__(self, watchlist: List[str] = None):
         self.watchlist = watchlist or FULL_WATCHLIST
         self.data_cache: Dict[str, pd.DataFrame] = {}
-
-    def fetch_price_history(self, ticker: str, days: int = PRICE_HISTORY_DAYS) -> Optional[pd.DataFrame]:
-        try:
-            end = datetime.today()
-            start = end - timedelta(days=days + 120)
-            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-            if df is None or df.empty:
-                log.warning(f"Keine Daten für {ticker}")
-                return None
-            df = self._normalize_ohlcv_columns(df)
-            try:
-                df.index = pd.to_datetime(df.index)
-                df = df.sort_index()
-            except Exception:
-                pass
-            self.data_cache[ticker] = df
-            return df
-        except Exception as e:
-            log.error(f"Fehler beim Laden von {ticker}: {e}")
-            return None
 
     def _empty_metrics(self, ticker: str) -> Dict:
         """Leeres, aber vollständiges Dict für fehlgeschlagene Ticker."""
@@ -91,6 +68,26 @@ class MarketDataCollector:
             "data_points": 0,
             "last_updated": datetime.now().isoformat(),
         }
+
+    def fetch_price_history(self, ticker: str, days: int = PRICE_HISTORY_DAYS) -> Optional[pd.DataFrame]:
+        try:
+            end = datetime.today()
+            start = end - timedelta(days=days + 120)
+            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                log.debug(f"Keine Daten für {ticker}")
+                return None
+            df = self._normalize_ohlcv_columns(df)
+            try:
+                df.index = pd.to_datetime(df.index)
+                df = df.sort_index()
+            except Exception:
+                pass
+            self.data_cache[ticker] = df
+            return df
+        except Exception as e:
+            log.debug(f"Fehler beim Laden von {ticker}: {e}")
+            return None
 
     def calculate_metrics(self, ticker: str, spy_close: Optional[pd.Series] = None) -> Dict:
         """
