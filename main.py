@@ -1,5 +1,5 @@
 """
-AI Trading Bot - Hauptprogramm (Top-N Score-Modus, Zweiphasen-Ausführung)
+AI Trading Bot - Hauptprogramm (Top-N Score-Modus, Zweiphasen)
 ===========================================================================
 - Verwendet bestehenden CPO (cpo_engine) und PortfolioRebalancer
 - Führt SELLs zuerst aus → Broker‑Sync → dann BUYs mit aktualisiertem Cash
@@ -185,75 +185,38 @@ class TradingBot:
             regime_state=regime_state,
         )
 
-        # KI-Analyse (optional, nur für Journal)
-        class MockAllocation:
-            def __init__(self, targets, cash_t, rationale):
-                self.target_allocations = targets
-                self.cash_target = cash_t
-                self.rationale = rationale
-                self.recommended_sells = []
-        mock_allocation = MockAllocation(target_weights, cash_target, rebalance_rationale)
+        # ========== TRADE-ENTSCHEIDUNGEN AUS REBALANCING EXTRAHIEREN ==========
+        # Die `rebalancing_decisions` sind bereits `RebalancingDecision` Objekte mit Aktion und Zielgewicht.
+        # Wir wandeln sie in das interne Dict-Format um.
+        rebalance_trades = []
+        for rd in rebalancing_decisions:
+            rebalance_trades.append({
+                "ticker": rd.ticker,
+                "action": rd.action,
+                "target_allocation": rd.target_weight,
+                "confidence": rd.confidence,
+                "reason": rd.reason,
+                "risk_approved": True,
+            })
 
-        ai_result = self.ai_analyzer.analyze(
-            portfolio_summary=portfolio_summary_before,
-            market_data=market_data,
-            news_text=news_text,
-            watchlist=effective_watchlist,
-            journal_entries=journal.get_history()[-10:],
-            regime_state=regime_state,
-            portfolio_allocation=mock_allocation,
-        )
-        raw_ai_decisions = ai_result.get("decisions", [])
+        # Weitere Entscheidungen: KI, DecisionWeighter (optional) – hier vereinfacht,
+        # da wir nur die rebalancing_trades verwenden wollen. Aber für Kompatibilität:
+        # (Der bisherige Code mit AI und DecisionWeighter wird auskommentiert, da wir nur CPO nutzen)
+        ai_result = {"market_outlook": "CPO-basierte Optimierung", "risk_assessment": "Score-basiertes Rebalancing"}
+        raw_ai_decisions = []
+        # merged_decisions = []  # nicht benötigt
 
-        # Decision Weighter (optional, für Journal)
-        weighted_signals = []
-        for ticker in set(scores.keys()) | set(self.portfolio.positions.keys()):
-            quant_score = scores.get(ticker, 50.0)
-            ai_conf = next((d.get("confidence", 0.5) * 100 for d in raw_ai_decisions if d["ticker"] == ticker), 50.0)
-            vol = volatilities.get(ticker, 20.0)
-            risk_score = max(-1.0, min(1.0, (15.0 - vol) / 50.0))
-            current_w = current_weights.get(ticker, 0.0)
-            target_w = target_weights.get(ticker, current_w)
-            cpo_score = max(-1.0, min(1.0, (target_w - current_w) * 5))
-            weighted_signals.append(WeightedSignal(
-                ticker=ticker,
-                quant_score=quant_score,
-                ai_confidence=ai_conf,
-                risk_score=risk_score,
-                cpo_score=cpo_score,
-                current_weight=current_w,
-                target_weight=target_w,
-                risk_approved=True,
-            ))
+        # Wir verwenden ausschließlich die Trades aus dem Rebalancer
+        decisions = rebalance_trades
 
-        high_volatility = market_data.get("vix", 15) > 35
-        weighted_decisions = self.decision_weighter.process_assets(weighted_signals, regime_state, high_volatility)
-
-        decision_map = {d["ticker"]: d for d in weighted_decisions}
-        for d in raw_ai_decisions:
-            if d["ticker"] not in decision_map:
-                decision_map[d["ticker"]] = d
-        merged_decisions = list(decision_map.values())
-
-        # Normalisierung
-        normalized_decisions, norm_warnings = normalize_ai_decisions(
-            decisions=merged_decisions,
-            positions=self.portfolio.positions,
-            total_value=portfolio_summary_before.get("total_value", 100_000),
-            market_data=market_data,
-            correlation_groups=CORRELATION_GROUPS,
-        )
-        if norm_warnings:
-            run_summary["normalization_warnings"] = norm_warnings
-
-        # Cooldown-Filter (zeitlich)
-        decisions, cooldown_warnings = cooldown_manager.filter_decisions(normalized_decisions)
-        if cooldown_warnings:
-            run_summary["cooldown_warnings"] = cooldown_warnings
-
-        # Stop-Loss & Zombie (erzwungen)
+        # Stop-Loss & Zombie hinzufügen
         stop_loss_orders = self.risk_manager.check_stop_loss(self.portfolio.positions, market_data)
         decisions = stop_loss_orders + trailing_stops + zombie_orders + decisions
+
+        # Cooldown-Filter
+        decisions, cooldown_warnings = cooldown_manager.filter_decisions(decisions)
+        if cooldown_warnings:
+            run_summary["cooldown_warnings"] = cooldown_warnings
 
         # ========== ZWEIPHASEN-AUSFÜHRUNG ==========
         execution_enabled = (
@@ -264,7 +227,6 @@ class TradingBot:
 
         if not execution_enabled:
             log.info("SCHRITT 7/8: Execution disabled – nur Simulation")
-            # Nur Risikoprüfung für Logging
             validated, risk_warnings = self.risk_manager.validate_decisions(
                 decisions=decisions,
                 portfolio_summary=portfolio_summary_before,
@@ -272,8 +234,6 @@ class TradingBot:
                 historical_returns=historical_returns,
             )
             run_summary["risk_warnings"] = risk_warnings
-            simulated_trades = self._simulate_trades(decisions, current_prices, total_value, current_weights)
-            executed_records = []
             sells_executed = 0
             buys_executed = 0
         else:
@@ -381,10 +341,6 @@ class TradingBot:
                 log.info("  Keine BUYs")
                 buys_executed = 0
 
-            validated = []  # nicht weiter benötigt, da Trades direkt ausgeführt
-            simulated_trades = []
-            executed_records = []
-
         # Abschließende Portfolio-Konsistenz
         self._check_portfolio_consistency(market_data)
         portfolio_summary_after = self._build_portfolio_summary()
@@ -393,20 +349,20 @@ class TradingBot:
         # Portfolio-Report
         self._print_portfolio_report(current_weights, target_weights, scores)
 
-        # Journal (vereinfacht)
+        # Journal
         journal.log_run(
             market_outlook=ai_result.get("market_outlook", "CPO-basierte Optimierung"),
             risk_assessment=ai_result.get("risk_assessment", ""),
             ai_signals=raw_ai_decisions,
-            final_decisions=validated if execution_enabled else [],
-            simulated_trades=simulated_trades,
-            executed_trades=executed_records,
+            final_decisions=decisions,
+            simulated_trades=[],
+            executed_trades=[],
             portfolio_before=portfolio_summary_before,
             portfolio_after=portfolio_summary_after,
             portfolio_projection=None,
             risk_warnings=run_summary.get("risk_warnings", []),
             mode=self.mode,
-            feedback_learnings=ai_result.get("feedback_learnings", ""),
+            feedback_learnings="",
             regime_state=regime_state,
             market_data=market_data,
             execution_mode="LIVE" if execution_enabled else "SIMULATED",
@@ -464,31 +420,10 @@ class TradingBot:
             ticker=ticker,
             position_qty=position_qty,
             current_price=price,
-            target_value=0.0,   # vollständiger Verkauf (wird von trade_executor korrekt behandelt)
+            target_value=0.0,
             reason=trade.get("reason", "CPO Rebalancing"),
             full_liquidation=is_zombie,
         )
-
-    def _simulate_trades(self, trades, current_prices, total_value, current_weights):
-        """Simuliert Trades für Journal (wenn keine echte Ausführung)"""
-        simulated = []
-        for t in trades:
-            price = current_prices.get(t["ticker"], 0)
-            if price <= 0:
-                continue
-            value = t.get("target_allocation", 0) * total_value
-            simulated.append({
-                "ticker": t["ticker"],
-                "action": t["action"],
-                "target_alloc": t.get("target_allocation", 0),
-                "value": value,
-                "quantity": value / price if price > 0 else 0,
-                "price": price,
-                "current_alloc": current_weights.get(t["ticker"], 0),
-                "ai_reason": t.get("reason", ""),
-                "ai_confidence": t.get("confidence", 0),
-            })
-        return simulated
 
     def _print_portfolio_report(self, current_weights: Dict, target_weights: Dict, scores: Dict):
         log.info("\n" + "=" * 70)
