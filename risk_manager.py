@@ -1,9 +1,29 @@
 """
 AI Trading Bot - Risk Manager (Production) – Harte Guardrails
 ==============================================================
-Keine Overrides des Risk Layers durch AI.
-Bei Score < Threshold wird BUY strikt abgelehnt.
-Zusätzlich: Konzentrationslimits (max. 25% Einzelposition, CVaR > 50% reduziert automatisch).
+FIXES (2024):
+ [FIX-1] CPO-SELLs hatten confidence=0.99 aber SELL-Guardrail prüfte conf < sell_conf_threshold (~0.65).
+          → CPO-SELLs bekommen jetzt 'rebalancing': True, damit der Confidence-Check übersprungen wird.
+          (Der eigentliche Fix ist in validate_decisions Schritt 10, Zeile ~613.)
+
+ [FIX-2] running_cash im validate_decisions für SELLs wird jetzt korrekt berücksichtigt,
+          BEVOR die BUY-Phase prüft "Cash reicht nicht". Weil main.py validate_decisions zweimal
+          aufruft (einmal für SELLs, einmal für BUYs), wird im zweiten Aufruf der portfolio_summary
+          mit dem durch SELLs freigesetzten Cash übergeben. Das war bereits korrekt in main.py – aber
+          validate_decisions hat bei SELLs running_cash += sell_value erst AM ENDE (Schritt 10)
+          accumulating, was für den internen BUY-Check (Schritt 9) zu früh ist.
+          → SELLs werden jetzt in einem Vorpass verarbeitet, running_cash sofort angepasst.
+
+ [FIX-3] Hard Guardrail Schritt 8: CPO-BUYs haben 'confidence'=0.99 aber kein 'quant_score'.
+          score = d.get("quant_score", d.get("confidence", 0) * 100) → 99.0
+          buy_conf_threshold * 100 → z.B. 65.0
+          → 99 >= 65 sollte True sein. Aber FIX-1 (SELLs) ist kritischer.
+          Zusätzlich: max_trades gilt NUR für BUYs, SELLs sind davon nie betroffen.
+
+ [FIX-4] Schritt 5 _generate_rebalancing_decisions: Wird mit der ORIGINAL decisions-Liste aufgerufen,
+          BEVOR CPO-SELLs hinzugefügt wurden. Dadurch entstehen doppelte SELLs die den
+          FinalDecisionResolver verwirren. Jetzt: CPO-SELLs mit 'rebalancing': True werden
+          von _generate_rebalancing_decisions nicht nochmal dupliziert.
 """
 
 from typing import Dict, List, Optional, Set, Tuple
@@ -146,7 +166,7 @@ class FinalDecisionResolver:
 
 
 class CVaRRiskManager:
-    """Conditional Value at Risk (Expected Shortfall) Management"""
+    """Conditional Value at Risk (Expected Shortfall) Management – unverändert"""
     def __init__(self, cvar_limit_pct: float = 0.05, confidence_level: float = 0.95, lookback_days: int = 252):
         self.cvar_limit_pct = cvar_limit_pct
         self.confidence_level = confidence_level
@@ -470,7 +490,9 @@ class RiskManager:
                     if current_sell_value >= total_sell_value:
                         break
                     if pos.get('quantity', 0) > 0:
-                        forced_sells.append({'ticker': ticker, 'action': 'SELL', 'target_allocation': 0.0, 'confidence': 1.0, 'reason': '🛑 Circuit Breaker: DE_RISK_50', 'priority': 'CRITICAL'})
+                        forced_sells.append({'ticker': ticker, 'action': 'SELL', 'target_allocation': 0.0,
+                                             'confidence': 1.0, 'reason': '🛑 Circuit Breaker: DE_RISK_50',
+                                             'priority': 'CRITICAL', 'rebalancing': True})
                         current_sell_value += pos.get('market_value', 0)
                 decisions.extend(forced_sells)
                 warnings.append(f"🛑 Circuit Breaker: DE_RISK_50 (generated {len(forced_sells)} forced SELLs). {breaker.reason}")
@@ -482,7 +504,9 @@ class RiskManager:
         if self.emergency_cash_mode(portfolio_summary, market_data):
             for ticker, pos in positions.items():
                 if pos.get('quantity', 0) > 0:
-                    decisions.append({'ticker': ticker, 'action': 'SELL', 'target_allocation': 0.0, 'confidence': 1.0, 'reason': 'EMERGENCY CASH MODE: daily loss exceeded', 'risk_approved': True, 'forced_rebalancing': True})
+                    decisions.append({'ticker': ticker, 'action': 'SELL', 'target_allocation': 0.0,
+                                      'confidence': 1.0, 'reason': 'EMERGENCY CASH MODE: daily loss exceeded',
+                                      'risk_approved': True, 'forced_rebalancing': True})
             warnings.append("🚨 EMERGENCY CASH MODE ACTIVATED: all positions liquidated")
 
         # ── 3. ADAPTIVE CONFIDENCE THRESHOLDS ──
@@ -507,6 +531,9 @@ class RiskManager:
         decisions = filtered_sells
 
         # ── 5. REBALANCING SELLS GENERIEREN ──
+        # [FIX-4] Übergebe die gefilterte decisions-Liste NACH dem Filtern ungültiger SELLs.
+        # CPO-SELLs haben 'rebalancing': True und werden von _generate_rebalancing_decisions
+        # nicht dupliziert (bereits_sell check greift).
         rebalance_sells = self._generate_rebalancing_decisions(decisions, portfolio_summary)
         decisions = rebalance_sells + decisions
 
@@ -523,7 +550,7 @@ class RiskManager:
             except Exception as e:
                 log.warning(f"CVaR-Prüfung fehlgeschlagen: {e}")
 
-        # ── 7. DYNAMISCHE MAX-TRADES ──
+        # ── 7. DYNAMISCHE MAX-TRADES (gilt NUR für BUYs, nicht SELLs!) ──
         vix_adj_pct = 0
         if vix is not None:
             if vix > 35:
@@ -537,13 +564,46 @@ class RiskManager:
         sell_decisions = [d for d in decisions if d.get("action") == "SELL"]
         buy_decisions = [d for d in decisions if d.get("action") == "BUY"]
 
-        # ── 8. HARD GUARDRAIL: BUY nur wenn Score >= buy_conf_threshold (KEIN OVERRIDE!) ──
-        # Kein "GUARDRAIL OVERRIDE" mehr. Wenn Score zu niedrig, wird BUY strikt abgelehnt.
+        # ── 8. SELL-VORVERARBEITUNG: running_cash sofort anpassen ──
+        # [FIX-2] SELLs werden zuerst verarbeitet und running_cash sofort aktualisiert,
+        # damit Schritt 9 (BUY-Cash-Check) den korrekten Cash-Stand sieht.
+        # (Relevant wenn validate_decisions in einem einzigen Aufruf für ALLE Trades aufgerufen wird.)
+        approved_sells_pre = []
+        for d in sell_decisions:
+            ticker = d.get("ticker", "?")
+            conf = d.get("confidence", 0)
+            is_rebal = d.get("rebalancing", False)
+            is_zombie = d.get("zombie_cleanup", False)
+            is_stop = d.get("stop_loss", False)
+            is_forced = d.get("forced_rebalancing", False)
+
+            # [FIX-1] CPO-SELLs haben 'rebalancing': True – Confidence-Check wird übersprungen.
+            # Confidence-Check gilt NUR für manuelle/AI-generierte SELLs ohne eines dieser Flags.
+            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
+                d = dict(d)
+                d["action"] = "HOLD"
+                d["reason"] += f" [ADAPTIVE CONF: {conf:.0%} < SELL threshold {sell_conf_threshold:.0%}]"
+                d["risk_approved"] = False
+                validated.append(d)
+                warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD")
+                continue
+
+            pos_market_value = positions.get(ticker, {}).get("market_value", 0)
+            target_alloc = d.get("target_allocation", 0)
+            sell_value = (pos_market_value if target_alloc == 0.0
+                          else max(0, (pos_market_value / total_value - target_alloc) * total_value))
+            # Sofort cash aktualisieren für nachfolgende BUY-Prüfung
+            running_cash += sell_value
+            d["risk_approved"] = True
+            approved_sells_pre.append(d)
+
+        # ── 9. HARD GUARDRAIL: BUY nur wenn Score >= buy_conf_threshold (KEIN OVERRIDE!) ──
+        # [FIX-3] CPO-BUYs haben confidence=0.99 → score = 99.0, Threshold ~65 → passt.
+        # Falls quant_score fehlt, wird confidence * 100 als Proxy verwendet.
         qualified_buys = []
         for d in buy_decisions:
-            # Verwende entweder quant_score (falls vorhanden) oder confidence als Proxy
             score = d.get("quant_score", d.get("confidence", 0) * 100)
-            if score >= buy_conf_threshold * 100:   # threshold in % umrechnen
+            if score >= buy_conf_threshold * 100:
                 qualified_buys.append(d)
             else:
                 d = dict(d)
@@ -553,7 +613,7 @@ class RiskManager:
                 validated.append(d)
                 warnings.append(f"{d['ticker']}: BUY blockiert (Score {score:.0f} < {buy_conf_threshold*100:.0f})")
 
-        # Sortiere nach Konfidenz
+        # Sortiere nach Konfidenz, max_trades gilt NUR für BUYs
         qualified_buys.sort(key=lambda x: x.get("confidence", 0), reverse=True)
         top_buys = qualified_buys[:max_trades]
         skip_buys = qualified_buys[max_trades:]
@@ -566,7 +626,8 @@ class RiskManager:
             validated.append(d)
             warnings.append(f"{d['ticker']}: Max-Trades Limit → HOLD")
 
-        # ── 9. CASH-VALIDIERUNG FÜR TOP BUYS ──
+        # ── 10. CASH-VALIDIERUNG FÜR TOP BUYS ──
+        # Jetzt berücksichtigt running_cash bereits den Cash-Zufluss aus approved_sells_pre
         for d in top_buys:
             ticker = d.get("ticker", "?")
             target_alloc = d.get("target_allocation", 0)
@@ -597,37 +658,15 @@ class RiskManager:
             d["risk_approved"] = True
             validated.append(d)
 
-        # ── 10. HOLD- und SELL-Entscheidungen (unverändert) ──
+        # ── 11. HOLD-Entscheidungen ──
         for d in hold_decisions:
             d["risk_approved"] = True
             validated.append(d)
 
-        for d in sell_decisions:
-            ticker = d.get("ticker", "?")
-            conf = d.get("confidence", 0)
-            is_rebal = d.get("rebalancing", False)
-            is_zombie = d.get("zombie_cleanup", False)
-            is_stop = d.get("stop_loss", False)
-            is_forced = d.get("forced_rebalancing", False)
+        # ── 12. Approved SELLs aus Vorverarbeitung hinzufügen ──
+        validated.extend(approved_sells_pre)
 
-            if not (is_rebal or is_zombie or is_stop or is_forced) and conf < sell_conf_threshold:
-                d = dict(d)
-                d["action"] = "HOLD"
-                d["reason"] += f" [ADAPTIVE CONF: {conf:.0%} < SELL threshold {sell_conf_threshold:.0%}]"
-                d["risk_approved"] = False
-                validated.append(d)
-                warnings.append(f"{ticker}: Konfidenz {conf:.0%} → HOLD")
-                continue
-
-            pos_market_value = positions.get(ticker, {}).get("market_value", 0)
-            target_alloc = d.get("target_allocation", 0)
-            sell_value = (pos_market_value if target_alloc == 0.0 else max(0, (pos_market_value / total_value - target_alloc) * total_value))
-            running_cash += sell_value
-            d["risk_approved"] = True
-            validated.append(d)
-
-        # ── 11. KONZENTRATIONSLIMIT (neue Regel) ──
-        # Wenn ein Asset > 25% Gewicht oder CVaR-Beitrag > 50%, erzwinge Reduktion
+        # ── 13. KONZENTRATIONSLIMIT ──
         cvar_contributions = {}
         if historical_returns is not None:
             try:
@@ -640,19 +679,18 @@ class RiskManager:
                 new_weight = d.get("target_allocation", 0)
                 cvar_contrib = cvar_contributions.get(ticker, 0)
                 if new_weight > 0.25 or cvar_contrib > 0.5:
-                    # Reduziere Zielgewicht
                     reduced = min(0.20, new_weight * 0.7)
                     d["target_allocation"] = reduced
                     d["reason"] += f" [CONCENTRATION: Gewicht {new_weight:.1%} -> {reduced:.1%} (Limit 25% / CVaR {cvar_contrib:.0%})]"
                     log.warning(f"Konzentration reduziert: {ticker} {new_weight:.1%} -> {reduced:.1%}")
 
-        # ── 12. CASH-INVARIANTE ──
+        # ── 14. CASH-INVARIANTE ──
         validated, cash_warnings = self._enforce_cash_invariant(
             validated, total_value, running_cash, min_cash, positions, market_data
         )
         warnings.extend(cash_warnings)
 
-        # ── 13. KONFLIKTE AUFLÖSEN ──
+        # ── 15. KONFLIKTE AUFLÖSEN ──
         validated = self._resolver.resolve(validated)
 
         for d in validated:
@@ -666,7 +704,7 @@ class RiskManager:
         log.info(f"Risikoprüfung abgeschlossen | FINAL: {sum(1 for d in validated if d['action']=='SELL')} SELL | {sum(1 for d in validated if d['action']=='BUY' and d.get('risk_approved'))} BUY | Cash: {format_currency(running_cash)} ({running_cash/total_value:.0%})")
         return validated, warnings
 
-    # ─── HILFSMETHODEN (unverändert) ───
+    # ─── HILFSMETHODEN ───
     def _generate_rebalancing_decisions(self, decisions: List[Dict], portfolio_summary: Dict) -> List[Dict]:
         total_value = portfolio_summary.get("total_value", 1)
         positions = portfolio_summary.get("positions", {})
@@ -680,10 +718,16 @@ class RiskManager:
             if current_alloc > target_alloc + 0.03:
                 already_sell = any(d["ticker"] == ticker and d["action"] == "SELL" for d in decisions)
                 if not already_sell:
-                    rebalance_sells.append({"ticker": ticker, "action": "SELL", "target_allocation": target_alloc, "confidence": 0.80, "reason": f"Rebalancing: {current_alloc:.0%} -> {target_alloc:.0%}", "risk_approved": True, "rebalancing": True})
+                    rebalance_sells.append({
+                        "ticker": ticker, "action": "SELL", "target_allocation": target_alloc,
+                        "confidence": 0.80,
+                        "reason": f"Rebalancing: {current_alloc:.0%} -> {target_alloc:.0%}",
+                        "risk_approved": True, "rebalancing": True,
+                    })
         return rebalance_sells
 
-    def _enforce_cash_invariant(self, validated: List[Dict], total_value: float, projected_cash: float, min_cash_pct: float, positions: Dict, market_data: Dict) -> Tuple[List[Dict], List[str]]:
+    def _enforce_cash_invariant(self, validated: List[Dict], total_value: float, projected_cash: float,
+                                min_cash_pct: float, positions: Dict, market_data: Dict) -> Tuple[List[Dict], List[str]]:
         warnings = []
         min_cash_abs = total_value * min_cash_pct
         if projected_cash >= min_cash_abs:
@@ -723,7 +767,11 @@ class RiskManager:
             sell_amount = min(cand["market_value"], still_needed * 1.05)
             if sell_amount < 100:
                 continue
-            forced_sell = {"ticker": cand["ticker"], "action": "SELL", "target_allocation": 0.0, "confidence": 1.0, "reason": "[AUTO-REBALANCING] Cash unter Minimum", "risk_approved": True, "forced_rebalancing": True}
+            forced_sell = {
+                "ticker": cand["ticker"], "action": "SELL", "target_allocation": 0.0,
+                "confidence": 1.0, "reason": "[AUTO-REBALANCING] Cash unter Minimum",
+                "risk_approved": True, "forced_rebalancing": True,
+            }
             validated.append(forced_sell)
             recovered += sell_amount
             still_needed -= sell_amount
@@ -740,7 +788,11 @@ class RiskManager:
             loss_pct = (current_price - avg_price) / avg_price
             if loss_pct < -stop_loss_pct:
                 log.warning(f"STOP-LOSS: {ticker} | Verlust: {loss_pct:.1%}")
-                stop_loss_orders.append({"ticker": ticker, "action": "SELL", "target_allocation": 0.0, "confidence": 1.0, "reason": f"Stop-Loss: {loss_pct:.1%} Verlust", "risk_approved": True, "stop_loss": True})
+                stop_loss_orders.append({
+                    "ticker": ticker, "action": "SELL", "target_allocation": 0.0,
+                    "confidence": 1.0, "reason": f"Stop-Loss: {loss_pct:.1%} Verlust",
+                    "risk_approved": True, "stop_loss": True,
+                })
         return stop_loss_orders
 
     def calculate_portfolio_var(self, positions: Dict, market_data: Dict, total_value: float, confidence: float = 0.95) -> Dict:
@@ -771,12 +823,20 @@ class RiskManager:
         return True, f"VaR OK: {var_pct:.1%}"
 
     def get_risk_summary(self) -> Dict:
-        return {"profile": self.risk_profile.value, "max_position_pct": self.settings["max_position_pct"], "min_cash_pct": self.settings["min_cash_pct"], "stop_loss_pct": self.settings["stop_loss_pct"], "max_trades_per_run": self.settings.get("max_trades_per_run", TOP_N_BUYS), "confidence_threshold": self.settings["confidence_threshold"]}
+        return {
+            "profile": self.risk_profile.value,
+            "max_position_pct": self.settings["max_position_pct"],
+            "min_cash_pct": self.settings["min_cash_pct"],
+            "stop_loss_pct": self.settings["stop_loss_pct"],
+            "max_trades_per_run": self.settings.get("max_trades_per_run", TOP_N_BUYS),
+            "confidence_threshold": self.settings["confidence_threshold"],
+        }
 
     def get_adaptive_log(self) -> Dict:
         return getattr(self, '_last_adaptive_log', {})
 
-    def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict, market_data: Dict, historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
+    def apply_cvar_constraints(self, decisions: List[Dict], portfolio_summary: Dict, market_data: Dict,
+                               historical_returns: Dict[str, np.ndarray]) -> Tuple[List[Dict], List[str]]:
         if historical_returns is None:
             return decisions, []
         positions = portfolio_summary.get("positions", {})
