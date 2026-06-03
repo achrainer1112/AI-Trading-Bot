@@ -1,12 +1,10 @@
 """
-AI Trading Bot - Hauptprogramm (Top-N Score-Modus, strikt sequenziell)
-========================================================================
-- Berechnet Zielportfolio basierend auf Score-Ranking (Top N, Mindestscore)
-- Erzeugt SELLs (vollständig + Rebalancing) und BUYs aus Ziel-Ist-Differenz
-- Führt SELLs zuerst aus, synchronisiert Cash, führt dann BUYs aus
-- Keine Vermischung von SELL- und BUY-Validierung
-- Risk Manager bleibt vollständig erhalten, wird aber sequenziell angewendet
+AI Trading Bot - Hauptprogramm (streng sequenziell, mit korrekten SELLs)
 """
+
+import warnings
+warnings.filterwarnings("ignore", category=Warning, module="yfinance")
+warnings.filterwarnings("ignore", message=".*Timestamp.utcnow is deprecated.*")
 
 import argparse
 import json
@@ -170,7 +168,6 @@ class TradingBot:
             total_score = sum(s for _, s in top_assets)
             investable = 1.0 - MIN_CASH_PCT
             raw_weights = {t: (s / total_score) * investable for t, s in top_assets}
-            # Caps anwenden
             capped_weights = {}
             for t, w in raw_weights.items():
                 capped_weights[t] = min(w, MAX_POSITION_PCT)
@@ -190,7 +187,7 @@ class TradingBot:
 
         # ========== 2. TRADES AUS DIFFERENZ ABLEITEN ==========
         trades = []
-        # Verkäufe für Assets, die nicht im Zielportfolio sind
+        # SELLs: Assets die im Portfolio sind, aber nicht im Zielportfolio oder übergewichtet
         for ticker, current in current_weights.items():
             if ticker == "CASH":
                 continue
@@ -204,7 +201,7 @@ class TradingBot:
                     "reason": f"CPO: Reduziere von {current:.1%} auf {target:.1%}",
                     "risk_approved": True,
                 })
-        # Käufe für Assets, die im Zielportfolio sind, aber untergewichtet
+        # BUYs: Assets im Zielportfolio, die untergewichtet sind
         for ticker, target in target_weights.items():
             current = current_weights.get(ticker, 0.0)
             if target > current:
@@ -217,10 +214,7 @@ class TradingBot:
                     "risk_approved": True,
                 })
 
-        # Zombie-Orders hinzufügen
         trades.extend(zombie_orders)
-
-        # Cooldown-Filter
         trades, cooldown_warnings = cooldown_manager.filter_decisions(trades)
         if cooldown_warnings:
             run_summary["cooldown_warnings"] = cooldown_warnings
@@ -234,7 +228,6 @@ class TradingBot:
 
         if not execution_enabled:
             log.info("\nSCHRITT 6/8: Execution disabled – nur Simulation")
-            # Nur Risikoprüfung für Logging (ohne Ausführung)
             validated, risk_warnings = self.risk_manager.validate_decisions(
                 decisions=trades,
                 portfolio_summary=portfolio_summary_before,
@@ -245,7 +238,6 @@ class TradingBot:
             sells_executed = 0
             buys_executed = 0
         else:
-            # Phase 1: SELLs ausführen
             sell_trades = [t for t in trades if t["action"] == "SELL"]
             buy_trades = [t for t in trades if t["action"] == "BUY"]
 
@@ -277,7 +269,6 @@ class TradingBot:
                         )
                 run_summary["sells_executed"] = sells_executed
 
-                # Broker-Sync nach SELLs (Cash aktualisieren)
                 if sells_executed > 0:
                     log.info("\n  ── Phase 2: Broker-Sync nach SELLs ──")
                     time.sleep(2)
@@ -291,7 +282,6 @@ class TradingBot:
                 log.info("\n  ── Phase 1: Keine SELLs ──")
                 sells_executed = 0
 
-            # Phase 3: BUYs mit aktualisiertem Cash ausführen
             if buy_trades:
                 log.info(f"\n  ── Phase 3: {len(buy_trades)} BUY(s) mit aktualisiertem Cash ──")
                 # Aktualisiere Portfolio für BUYs (nach SELLs)
@@ -355,7 +345,7 @@ class TradingBot:
         # Portfolio-Report
         self._print_portfolio_report(current_weights, target_weights, scores)
 
-        # Journal (vereinfacht, ohne KI)
+        # Journal
         journal.log_run(
             market_outlook="CPO-basierte Optimierung (streng sequenziell)",
             risk_assessment="Score-basiertes Rebalancing mit sequenzieller Ausführung",
@@ -394,7 +384,7 @@ class TradingBot:
 
         return run_summary
 
-    # Hilfsmethoden (unverändert)
+    # Hilfsmethoden
     def _check_portfolio_consistency(self, market_data):
         if self.mode not in ("PAPER", "REAL", "LIVE") or not self.executor.api:
             return
@@ -422,13 +412,14 @@ class TradingBot:
         if (not price or price <= 0) and trade.get("price_estimated") and trade.get("price", 0) > 0:
             price = trade["price"]
         position_qty = self.portfolio.positions.get(ticker, {}).get("quantity", 0)
+        # 🔥 FIX: Bei CPO-SELLs immer vollständig liquidieren (target_weight = 0)
         return self.executor.execute_sell(
             ticker=ticker,
             position_qty=position_qty,
             current_price=price,
             target_value=0.0,
             reason=trade.get("reason", "CPO Rebalancing"),
-            full_liquidation=is_zombie,
+            full_liquidation=True,   # Wichtig: sonst wird kein SELL ausgeführt
         )
 
     def _print_portfolio_report(self, current_weights: Dict, target_weights: Dict, scores: Dict):
