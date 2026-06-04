@@ -211,13 +211,19 @@ class TradingBot:
         # ========== 2. TRADES AUS DIFFERENZ ABLEITEN ==========
         trades = []
 
-        # [FIX-A] SELLs: 'rebalancing': True setzen, damit Confidence-Check in validate_decisions
-        # nicht blockiert. CPO-SELLs sind per Definition gewollt und nicht AI-basiert.
+        # ── SELLs: Alle Positionen die über Zielgewicht liegen (oder nicht im Ziel sind) ──
+        # [FIX-A] 'rebalancing': True überspringt den Confidence-Check im Risk Manager.
+        # Toleranz: 1% (nicht 0.5%) damit Micro-Trades unter ~$11 vermieden werden.
+        # KEIN Ticker darf hier fehlen – sonst generiert _generate_rebalancing_decisions
+        # einen unkontrollierten SELL ohne korrespondierenden BUY.
+        TRADE_TOLERANCE = 0.01  # 1% Mindestabweichung für Trade-Generierung
+
         for ticker, current in current_weights.items():
             if ticker == "CASH":
                 continue
             target = target_weights.get(ticker, 0.0)
-            if current > target + 0.005:  # 0.5% Toleranz um Micro-Trades zu vermeiden
+            delta = current - target
+            if delta > TRADE_TOLERANCE:
                 trades.append({
                     "ticker": ticker,
                     "action": "SELL",
@@ -225,13 +231,15 @@ class TradingBot:
                     "confidence": 0.99,
                     "reason": f"CPO: Reduziere von {current:.1%} auf {target:.1%}",
                     "risk_approved": True,
-                    "rebalancing": True,          # [FIX-A] Pflicht!
+                    "rebalancing": True,   # [FIX-A] Pflicht! Überspringt Confidence-Check
                 })
+                log.debug(f"SELL geplant: {ticker} {current:.1%} → {target:.1%} (delta {delta:.1%})")
 
-        # BUYs: Assets im Zielportfolio, die untergewichtet sind
+        # ── BUYs: Assets im Zielportfolio die untergewichtet sind ──
         for ticker, target in target_weights.items():
             current = current_weights.get(ticker, 0.0)
-            if target > current + 0.005:  # 0.5% Toleranz
+            delta = target - current
+            if delta > TRADE_TOLERANCE:
                 trades.append({
                     "ticker": ticker,
                     "action": "BUY",
@@ -240,6 +248,7 @@ class TradingBot:
                     "reason": f"CPO: Erhöhe von {current:.1%} auf {target:.1%}",
                     "risk_approved": True,
                 })
+                log.debug(f"BUY geplant: {ticker} {current:.1%} → {target:.1%} (delta {delta:.1%})")
 
         # Stop-Loss und Zombie-Orders hinzufügen (haben Vorrang durch FinalDecisionResolver)
         trades.extend(stop_loss_orders)
