@@ -706,23 +706,57 @@ class RiskManager:
 
     # ─── HILFSMETHODEN ───
     def _generate_rebalancing_decisions(self, decisions: List[Dict], portfolio_summary: Dict) -> List[Dict]:
+        """
+        Generiert SELL-Orders für Positionen die ÜBER ihrem Zielgewicht liegen UND noch keinen
+        SELL-Trade in der decisions-Liste haben.
+
+        WICHTIG: Diese Methode darf nur für Positionen feuern, die NICHT bereits durch den CPO
+        abgedeckt sind. CPO-SELLs haben 'rebalancing': True und sind bereits in decisions.
+        Da der already_sell-Check greift, werden CPO-Tickers nie dupliziert.
+
+        Kritisch: Wenn ein Ticker eine BUY-Order hat (CPO will ihn aufstocken), darf kein
+        rebalancing-SELL generiert werden – das würde zum sofortigen Wieder-Liquidieren führen.
+        """
         total_value = portfolio_summary.get("total_value", 1)
         positions = portfolio_summary.get("positions", {})
-        target_map = {d["ticker"]: d.get("target_allocation", 0) for d in decisions if d.get("action") in ("BUY", "SELL")}
+
+        # Baue vollständige target_map aus allen BUY und SELL decisions
+        target_map = {
+            d["ticker"]: d.get("target_allocation", 0)
+            for d in decisions
+            if d.get("action") in ("BUY", "SELL")
+        }
+
+        # Tickers die bereits einen BUY-Trade haben → kein rebalancing-SELL!
+        tickers_with_buy = {d["ticker"] for d in decisions if d.get("action") == "BUY"}
+
         rebalance_sells = []
         for ticker, pos in positions.items():
             current_alloc = pos.get("market_value", 0) / total_value
             target_alloc = target_map.get(ticker)
+
+            # Nur handeln wenn Ticker im Zielportfolio bekannt ist
             if target_alloc is None:
                 continue
+
+            # Nicht verkaufen wenn gleichzeitig ein BUY geplant ist
+            if ticker in tickers_with_buy:
+                continue
+
             if current_alloc > target_alloc + 0.03:
-                already_sell = any(d["ticker"] == ticker and d["action"] == "SELL" for d in decisions)
+                already_sell = any(
+                    d["ticker"] == ticker and d["action"] == "SELL"
+                    for d in decisions
+                )
                 if not already_sell:
                     rebalance_sells.append({
-                        "ticker": ticker, "action": "SELL", "target_allocation": target_alloc,
+                        "ticker": ticker,
+                        "action": "SELL",
+                        "target_allocation": target_alloc,
                         "confidence": 0.80,
                         "reason": f"Rebalancing: {current_alloc:.0%} -> {target_alloc:.0%}",
-                        "risk_approved": True, "rebalancing": True,
+                        "risk_approved": True,
+                        "rebalancing": True,
                     })
         return rebalance_sells
 
