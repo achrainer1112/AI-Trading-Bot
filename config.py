@@ -212,34 +212,62 @@ DEFAULT_MIN_BUY_SCORE = 60
 SCORE_TOP_K_CANDIDATES = 8
 LLM_SCORE_OVERRIDE_LIMIT = 15
 
+
 # ─────────────────────────────────────────────
-# WATCHLIST & ETFs
+# WATCHLIST & ETFs (erweitert)
 # ─────────────────────────────────────────────
-ETF_WATCHLIST = ["SPY", "QQQ", "VT"]
-SECTOR_ETFS = ["XLV", "XLF", "XLE", "XLK"]
+ETF_WATCHLIST = ["SPY", "QQQ", "VT", "IWM", "VXUS", "BND", "GLD"]
+SECTOR_ETFS = ["XLV", "XLF", "XLE", "XLK", "XLI", "XLU"]
 STOCK_WATCHLIST = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "JPM", "V", "MA", "AMD"]
 FULL_WATCHLIST = ETF_WATCHLIST + SECTOR_ETFS + STOCK_WATCHLIST
 
 SECTOR_CLASSIFICATION = {
+    # Tech / Growth
     "AAPL": "tech", "MSFT": "tech", "NVDA": "tech", "AMD": "tech",
-    "QQQ": "tech", "XLK": "tech", "GOOGL": "consumer", "AMZN": "consumer",
-    "V": "financial", "MA": "financial", "JPM": "financial",
-    "XLV": "healthcare", "XLF": "financial", "XLE": "energy",
+    "QQQ": "tech", "XLK": "tech",
+    # Consumer
+    "GOOGL": "consumer", "AMZN": "consumer",
+    # Financial
+    "V": "financial", "MA": "financial", "JPM": "financial", "XLF": "financial",
+    # Healthcare
+    "XLV": "healthcare",
+    # Energy
+    "XLE": "energy",
+    # Industrials
+    "XLI": "industrials",
+    # Utilities
+    "XLU": "utilities",
+    # Diversified / Broad
     "SPY": "diversified", "VT": "diversified",
+    # Small Caps
+    "IWM": "small_cap",
+    # International
+    "VXUS": "international",
+    # Fixed Income
+    "BND": "fixed_income",
+    # Commodities
+    "GLD": "commodity",
 }
 
 FACTOR_CLASSIFICATION = {
     "QQQ": "tech", "XLK": "tech", "XLV": "healthcare", "XLF": "financial",
-    "XLE": "energy", "SPY": "diversified", "VT": "diversified",
+    "XLE": "energy", "XLI": "industrials", "XLU": "utilities",
+    "IWM": "small_cap", "VXUS": "international", "BND": "fixed_income", "GLD": "commodity",
+    "SPY": "diversified", "VT": "diversified",
 }
 
 CORRELATION_GROUPS = [
     ["SPY", "QQQ", "XLK", "VT", "AAPL", "MSFT", "AMZN"],
     ["QQQ", "XLK", "AAPL", "MSFT", "NVDA", "AMD"],
     ["XLF", "JPM", "V", "MA"],
+    ["IWM", "VB"],           # Small caps
+    ["VXUS", "EFA", "EEM"],  # International (später erweiterbar)
+    ["BND", "TLT", "AGG"],   # Fixed Income
+    ["GLD", "IAU"],          # Gold/Commodities
 ]
 
 ETF_SECTOR_WEIGHTS = {
+    # Bestehende
     "QQQ": {"tech": 0.70, "diversified": 0.30},
     "XLK": {"tech": 0.90, "diversified": 0.10},
     "SPY": {"diversified": 1.00},
@@ -247,8 +275,15 @@ ETF_SECTOR_WEIGHTS = {
     "XLV": {"healthcare": 0.80, "diversified": 0.20},
     "XLF": {"financial": 0.80, "diversified": 0.20},
     "XLE": {"energy": 0.80, "diversified": 0.20},
+    # Neue
+    "XLI": {"industrials": 0.80, "diversified": 0.20},
+    "XLU": {"utilities": 0.80, "diversified": 0.20},
+    "IWM": {"small_cap": 0.70, "diversified": 0.30},
+    "VXUS": {"international": 0.80, "diversified": 0.20},
+    "BND": {"fixed_income": 0.90, "diversified": 0.10},
+    "GLD": {"commodity": 0.85, "diversified": 0.15},
 }
-ETF_FACTOR_WEIGHTS = ETF_SECTOR_WEIGHTS
+ETF_FACTOR_WEIGHTS = ETF_SECTOR_WEIGHTS  # bleibt gleich
 
 # ─────────────────────────────────────────────
 # PORTFOLIO & TRADE EINSTELLUNGEN
