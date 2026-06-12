@@ -155,6 +155,7 @@ class TradingBot:
         )
         scores = {ticker: sb.total_score for ticker, sb in scores_obj.items()}
         current_weights = self.portfolio.get_allocations()
+        weights_before_run = dict(current_weights)  # Snapshot VOR dem Rebalancing (für finalen Report)
         total_value = portfolio_summary_before.get("total_value", self.portfolio.get_total_value())
         current_prices = {t: d.get("current_price", 0) for t, d in market_data.items()}
 
@@ -317,34 +318,65 @@ class TradingBot:
                 log.info("\n  ── Phase 1: Keine SELLs ──")
                 sells_executed = 0
 
-            # Phase 3: BUYs mit aktualisiertem Cash (alle geplanten Käufe ausführen)
+            # Phase 3: BUYs mit aktualisiertem Cash – Deltas NEU berechnen nach SELL-Sync
             if buy_trades:
-                log.info(f"\n  ── Phase 3: {len(buy_trades)} BUY(s) mit aktualisiertem Cash ──")
-                # Keine erneute Risikoprüfung – wir vertrauen auf die bereits skalierten Zielgewichte
+                log.info(f"\n  ── Phase 3: BUY-Deltas neu validieren nach SELL-Sync ──")
+
+                # WICHTIG: total_value und current_weights wurden nach SELL-Sync aktualisiert (Zeile 314–315).
+                # Wir berechnen buy_cost JETZT auf Basis der aktuellen Portfolio-Zahlen, nicht der
+                # ursprünglichen (vor SELLs). Das verhindert, dass bereits gehaltene Positionen
+                # doppelt gezählt werden.
                 total_value = self.portfolio.get_total_value()
                 min_cash_abs = max(0.0, total_value * MIN_CASH_PCT)
                 running_cash = self.portfolio.cash
 
-                # Optional: Sortiere BUYs nach Zielgewicht, um größere zuerst auszuführen (kein Einfluss auf Endergebnis)
-                buy_trades.sort(key=lambda x: x.get("target_allocation", 0), reverse=True)
+                log.info(f"  Cash verfügbar: {format_currency(running_cash)} | Min-Cash-Reserve: {format_currency(min_cash_abs)}")
+                log.info(f"  Total Value nach SELLs: {format_currency(total_value)}")
 
-                buys_executed = 0
+                # Neu validierte BUY-Liste: Deltas auf Basis des aktuellen Portfolios berechnen
+                validated_buys = []
                 for d in buy_trades:
                     if d.get("action") != "BUY" or not d.get("risk_approved"):
                         continue
                     ticker = d["ticker"]
                     target_alloc = d.get("target_allocation", 0)
+                    # Aktueller Marktwert NACH dem SELL-Sync
                     current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0)
-                    buy_cost = max(0, total_value * target_alloc - current_val)
+                    # Zielbetrag basierend auf aktuellem total_value
+                    target_val = total_value * target_alloc
+                    buy_cost = max(0.0, target_val - current_val)
                     price = current_prices.get(ticker, 0)
                     if price <= 0:
+                        log.warning(f"  [{ticker}] Kein Preis verfügbar – BUY übersprungen")
                         continue
-                    spendable = max(0.0, running_cash - min_cash_abs)
-                    if spendable < buy_cost:
-                        # Sollte wegen Skalierung nicht vorkommen, aber zur Sicherheit aufrunden
-                        buy_cost = spendable
                     if buy_cost < 1.0:
+                        log.info(f"  [{ticker}] Delta zu klein ({buy_cost:.2f} USD) – übersprungen")
                         continue
+                    validated_buys.append({**d, "_buy_cost": buy_cost, "_price": price})
+
+                # Sortiere nach Zielgewicht (größte zuerst – kein Einfluss auf Endergebnis, aber besser für Logs)
+                validated_buys.sort(key=lambda x: x.get("target_allocation", 0), reverse=True)
+
+                log.info(f"  Geplante BUYs: {len(validated_buys)}")
+                for b in validated_buys:
+                    log.info(f"    {b['ticker']}: Ziel {b.get('target_allocation', 0):.1%} | Delta {b['_buy_cost']:.2f} USD")
+
+                buys_executed = 0
+                for d in validated_buys:
+                    ticker = d["ticker"]
+                    buy_cost = d["_buy_cost"]
+                    price = d["_price"]
+
+                    spendable = max(0.0, running_cash - min_cash_abs)
+                    if spendable < 1.0:
+                        log.warning(f"  [{ticker}] Kein investierbarer Cash mehr ({spendable:.2f} USD) – BUY gestoppt")
+                        break
+
+                    # Bei Cash-Engpass (sollte durch Skalierung nicht vorkommen): beschneiden, nicht überspringen
+                    if buy_cost > spendable:
+                        log.warning(f"  [{ticker}] Cash-Engpass: buy_cost {buy_cost:.2f} > spendable {spendable:.2f} – beschneide")
+                        buy_cost = spendable
+
                     ok, record = self.executor.execute_buy(
                         ticker=ticker,
                         target_value=buy_cost,
@@ -363,24 +395,67 @@ class TradingBot:
                             quantity=record.get("fill_qty") or (actual_spent / price if price > 0 else 0),
                             price=record.get("fill_price") or price,
                         )
+                        log.info(f"  [{ticker}] BUY ausgeführt: {actual_spent:.2f} USD | Cash verbleibend: {running_cash:.2f}")
+                    else:
+                        log.warning(f"  [{ticker}] BUY NICHT ausgeführt: {record.get('status', 'UNKNOWN')} | {record.get('reason', '')}")
+
                 run_summary["buys_executed"] = buys_executed
+                log.info(f"  Tatsächlich ausgeführte BUYs: {buys_executed}/{len(validated_buys)}")
+                log.info(f"  Verbleibender Cash: {format_currency(running_cash)}")
+
+                # Broker-Sync nach BUYs
+                log.info("\n  ── Phase 4: Broker-Sync nach BUYs ──")
+                time.sleep(2)
+                self.portfolio._load_from_alpaca()
+                total_value = self.portfolio.get_total_value()
+                log.info(f"  Cash nach BUYs: {format_currency(self.portfolio.cash)}")
+
+                # Phase 5: Zombie-Bereinigung (Positionen < MIN_POSITION_VALUE USD die nicht im Ziel sind)
+                MIN_POSITION_VALUE = 5.0
+                log.info(f"\n  ── Phase 5: Zombie-Bereinigung (Schwellwert: {MIN_POSITION_VALUE} USD) ──")
+                zombies_cleaned = 0
+                for ticker, pos in list(self.portfolio.positions.items()):
+                    market_val = pos.get("market_value", 0)
+                    in_target = ticker in target_weights and target_weights[ticker] > 0.005
+                    if market_val < MIN_POSITION_VALUE and not in_target:
+                        log.info(f"  [{ticker}] Zombie-Liquidation: {market_val:.4f} USD Restwert")
+                        zp = current_prices.get(ticker, 0)
+                        qty = pos.get("quantity", 0)
+                        if qty > 0:
+                            ok, record = self.executor.execute_sell(
+                                ticker=ticker,
+                                position_qty=qty,
+                                current_price=zp,
+                                target_value=0.0,
+                                reason=f"Zombie-Bereinigung: Restwert {market_val:.4f} USD < {MIN_POSITION_VALUE} USD",
+                                full_liquidation=True,
+                            )
+                            if ok:
+                                zombies_cleaned += 1
+                                self.portfolio.apply_trade(ticker=ticker, action="SELL", quantity=qty, price=zp)
+                                log.info(f"  [{ticker}] Zombie bereinigt ✓")
+                if zombies_cleaned > 0:
+                    log.info(f"  Bereinigte Zombie-Positionen: {zombies_cleaned}")
+                    time.sleep(1)
+                    self.portfolio._load_from_alpaca()
 
                 # Optional: Rundungsreste auf die höchstbewerteten Positionen verteilen
                 if buys_executed > 0:
-                    leftover = self.portfolio.cash - min_cash_abs
+                    total_value_final = self.portfolio.get_total_value()
+                    leftover = self.portfolio.cash - max(0.0, total_value_final * MIN_CASH_PCT)
                     if leftover > 5.0:
                         log.info(f"  ── Nachverteilung von Rundungsrest: {leftover:.2f} USD")
-                        held_tickers = list(self.portfolio.positions.keys())
+                        held_tickers = list(target_weights.keys())
                         held_tickers.sort(key=lambda t: scores.get(t, 0), reverse=True)
                         for ticker in held_tickers:
                             if leftover < 1.0:
                                 break
                             current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0)
-                            current_weight = current_val / total_value if total_value > 0 else 0
+                            current_weight = current_val / total_value_final if total_value_final > 0 else 0
                             max_add_weight = MAX_POSITION_PCT - current_weight
                             if max_add_weight <= 0:
                                 continue
-                            max_add_value = max_add_weight * total_value
+                            max_add_value = max_add_weight * total_value_final
                             add_value = min(leftover, max_add_value)
                             if add_value < 1.0:
                                 continue
@@ -392,7 +467,7 @@ class TradingBot:
                                 target_value=add_value,
                                 current_price=price,
                                 available_cash=self.portfolio.cash,
-                                min_cash_reserve=min_cash_abs,
+                                min_cash_reserve=max(0.0, total_value_final * MIN_CASH_PCT),
                                 reason="Rundungsrest-Nachverteilung",
                             )
                             if ok and record.get("status") == "EXECUTED":
@@ -413,8 +488,12 @@ class TradingBot:
         portfolio_summary_after = self._build_portfolio_summary()
         trade_logger.log_portfolio_snapshot(portfolio_summary_after)
 
-        # Portfolio-Report
-        self._print_portfolio_report(current_weights, target_weights, scores)
+        # Portfolio-Report (Zielabweichung: IST nach Run vs. SOLL; weights_before = Stand VOR dem Run)
+        self._print_portfolio_report(
+            weights_before=weights_before_run,
+            target_weights=target_weights,
+            scores=scores,
+        )
 
         # Journal
         journal.log_run(
@@ -505,27 +584,43 @@ class TradingBot:
             full_liquidation=full_liquidation,
         )
 
-    def _print_portfolio_report(self, current_weights: Dict, target_weights: Dict, scores: Dict):
+    def _print_portfolio_report(self, weights_before: Dict, target_weights: Dict, scores: Dict):
+        """
+        Zeigt finale Zielabweichung (IST nach Rebalancing vs. SOLL).
+        weights_before = Gewichte VOR dem Run (für Referenz).
+        actual_weights = Gewichte NACH dem Run (aus aktuellem Portfolio).
+        """
+        actual_weights = self.portfolio.get_allocations()
+
         log.info("\n" + "=" * 70)
-        log.info("📊 PORTFOLIO REPORT (Top-N Score-basiert, global skaliert)")
+        log.info("📊 PORTFOLIO REPORT – FINALE ZIELABWEICHUNG")
         log.info("=" * 70)
-        log.info("\nAKTUELLES PORTFOLIO:")
+        log.info(f"\n{'Ticker':<8} {'Ziel %':>8} {'Ist %':>8} {'Abw. %':>9} {'Score':>6}")
+        log.info("-" * 50)
+
+        all_tickers = sorted(
+            set(target_weights.keys()) | set(actual_weights.keys()),
+            key=lambda t: -target_weights.get(t, 0)
+        )
+        total_abs_deviation = 0.0
+        for ticker in all_tickers:
+            target = target_weights.get(ticker, 0.0)
+            actual = actual_weights.get(ticker, 0.0)
+            diff = actual - target
+            total_abs_deviation += abs(diff)
+            score = scores.get(ticker, 0)
+            flag = " ⚠️" if abs(diff) > 0.03 else ""
+            log.info(f"{ticker:<8} {target:>7.1%} {actual:>7.1%} {diff:>+8.1%} {score:>6.0f}{flag}")
+
+        log.info("-" * 50)
+        log.info(f"  Mittlere absolute Abweichung: {total_abs_deviation / max(len(all_tickers), 1):.2%}")
+        log.info(f"  Cash (Ist):  {format_currency(self.portfolio.cash)}")
+
+        log.info("\n  PORTFOLIO VOR DEM RUN (Referenz):")
         log.info(f"{'Ticker':<8} {'Gewicht':>10} {'Score':>6}")
-        for ticker, w in sorted(current_weights.items(), key=lambda x: -x[1])[:10]:
+        for ticker, w in sorted(weights_before.items(), key=lambda x: -x[1])[:10]:
             score = scores.get(ticker, 0)
             log.info(f"{ticker:<8} {w:>9.1%} {score:>6.0f}")
-        log.info("\nZIELPORTFOLIO (Top-N, skaliert):")
-        log.info(f"{'Ticker':<8} {'Gewicht':>10} {'Score':>6}")
-        for ticker, w in sorted(target_weights.items(), key=lambda x: -x[1])[:10]:
-            score = scores.get(ticker, 0)
-            log.info(f"{ticker:<8} {w:>9.1%} {score:>6.0f}")
-        log.info("\nDIFFERENZEN (Ziel - Aktuell > 2%):")
-        for ticker, target in target_weights.items():
-            current = current_weights.get(ticker, 0.0)
-            diff = target - current
-            if abs(diff) > 0.02:
-                action = "AUFSTOCKEN" if diff > 0 else "REDUZIEREN"
-                log.info(f"{ticker:<8} {action:<10} {diff:>+7.1%}")
         log.info("=" * 70)
 
     def show_status(self):
