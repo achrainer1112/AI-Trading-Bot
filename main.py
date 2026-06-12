@@ -452,8 +452,12 @@ class TradingBot:
                                 break
                             current_val = self.portfolio.positions.get(ticker, {}).get("market_value", 0)
                             current_weight = current_val / total_value_final if total_value_final > 0 else 0
-                            max_add_weight = MAX_POSITION_PCT - current_weight
-                            if max_add_weight <= 0:
+                            # FIX A: Obergrenze = Zielgewicht (nicht MAX_POSITION_PCT).
+                            # Verhindert, dass Positionen die ihr Ziel bereits erreicht haben
+                            # durch Rundungsrest-Nachverteilung auf 20% aufgebläht werden.
+                            target_weight_for_ticker = target_weights.get(ticker, 0.0)
+                            max_add_weight = target_weight_for_ticker - current_weight
+                            if max_add_weight <= 0.001:  # am Ziel oder drüber → überspringen
                                 continue
                             max_add_value = max_add_weight * total_value_final
                             add_value = min(leftover, max_add_value)
@@ -572,14 +576,23 @@ class TradingBot:
         
         if not full_liquidation and target_alloc > 0:
             target_value = total_value * target_alloc
+            # BUG-NACHWEIS: execute_sell in trade_executor übergibt target_value direkt als
+            # notional (Verkaufsbetrag), statt intern die Differenz (current_value - target_value)
+            # zu berechnen. Das führt dazu, dass z.B. IWM für $127 verkauft wird statt für ~$5.
+            # FIX HIER (defensiv): sell_notional explizit berechnen und statt target_value übergeben.
+            # ACHTUNG: erfordert, dass execute_sell einen `sell_notional`-Parameter akzeptiert
+            # ODER dass trade_executor.execute_sell gefixt wird (empfohlen).
+            current_position_value = position_qty * price
+            sell_notional = max(0.0, current_position_value - target_value)
         else:
             target_value = 0.0
+            sell_notional = position_qty * price  # Vollauflösung
         
         return self.executor.execute_sell(
             ticker=ticker,
             position_qty=position_qty,
             current_price=price,
-            target_value=target_value,
+            target_value=sell_notional,  # FIX B: Verkaufsbetrag (Delta), nicht Restwert
             reason=trade.get("reason", "CPO Rebalancing"),
             full_liquidation=full_liquidation,
         )
