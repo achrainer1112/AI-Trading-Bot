@@ -604,6 +604,8 @@ class TradingBot:
         actual_weights = Gewichte NACH dem Run (aus aktuellem Portfolio).
         """
         actual_weights = self.portfolio.get_allocations()
+        # CASH explizit als Zielgewicht eintragen (10%), damit der Report korrekt zeigt
+        target_weights = {**target_weights, "CASH": MIN_CASH_PCT}
 
         log.info("\n" + "=" * 70)
         log.info("📊 PORTFOLIO REPORT – FINALE ZIELABWEICHUNG")
